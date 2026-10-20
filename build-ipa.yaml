@@ -1,0 +1,86 @@
+name: Build IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: |
+          cat > project.yml <<'PROJECT_YML'
+          name: DayPlanner
+          options:
+            deploymentTarget:
+              iOS: "26.0"
+          targets:
+            DayPlanner:
+              type: application
+              platform: iOS
+              sources:
+                - Sources
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.example.dayplanner
+                  PRODUCT_NAME: DayPlanner
+                  SWIFT_VERSION: "5.0"
+                  MARKETING_VERSION: "1.1"
+                  CURRENT_PROJECT_VERSION: "1"
+                  TARGETED_DEVICE_FAMILY: "1"
+                  GENERATE_INFOPLIST_FILE: "YES"
+                  INFOPLIST_KEY_CFBundleDisplayName: "Распорядок"
+                  INFOPLIST_KEY_NSRemindersFullAccessUsageDescription: "Распорядок синхронизирует ваши задачи и напоминания о распорядке дня с приложением «Напоминания»."
+                  INFOPLIST_KEY_NSRemindersUsageDescription: "Распорядок синхронизирует ваши задачи и напоминания о распорядке дня с приложением «Напоминания»."
+                  INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES"
+                  INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
+                  INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: "YES"
+                  INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+                  CODE_SIGNING_ALLOWED: "NO"
+                  CODE_SIGNING_REQUIRED: "NO"
+                  CODE_SIGN_IDENTITY: ""
+          PROJECT_YML
+          xcodegen generate
+
+      - name: Build (unsigned archive)
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project DayPlanner.xcodeproj \
+            -scheme DayPlanner \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/DayPlanner.xcarchive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            2>&1 | tee build.log || {
+              grep -E "error:" build.log | sed 's|.*/Sources/||' | sort -u | head -10 | while IFS= read -r line; do
+                echo "::error title=Swift::$line"
+              done
+              exit 1
+            }
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/DayPlanner.xcarchive/Products/Applications/DayPlanner.app Payload/
+          zip -qry DayPlanner.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: DayPlanner-ipa
+          path: DayPlanner.ipa
