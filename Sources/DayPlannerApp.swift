@@ -560,7 +560,7 @@ struct AppBackground: View {
         let base = dark
             ? Color(red: 0.04, green: 0.05, blue: 0.09)
             : Color(red: 0.95, green: 0.96, blue: 0.99)
-        let k: Float = dark ? 0.45 : 0.6
+        let k: Double = dark ? 0.45 : 0.6
         let a = brand.mix(with: base, by: k)
         let b = Color.purple.mix(with: base, by: k + 0.1)
         let c = Color.orange.mix(with: base, by: k + 0.15)
