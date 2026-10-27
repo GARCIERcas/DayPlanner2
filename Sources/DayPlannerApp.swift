@@ -1,10 +1,10 @@
 //
 //  DayPlannerApp.swift
-//  Распорядок дня + To-Do  (v1.1)
+//  Распорядок дня + To-Do  (v1.2, MVP)
 //
 //  Требования: Xcode 26+, iOS 26.0+ (Liquid Glass).
 //  Для Напоминаний в Info.plist нужен ключ NSRemindersFullAccessUsageDescription
-//  (в build-ipa.yml он уже добавлен).
+//  (он уже добавлен в build-ipa.yml).
 //
 
 import SwiftUI
@@ -127,6 +127,12 @@ extension Date {
         let start = weekStart
         return (0..<7).map { start.addingDays($0) }
     }
+
+    /// Минуты от полуночи
+    var minutesOfDay: Int {
+        let c = cal.dateComponents([.hour, .minute], from: self)
+        return (c.hour ?? 0) * 60 + (c.minute ?? 0)
+    }
 }
 
 // MARK: - Модели
@@ -169,6 +175,59 @@ enum RoutineKind: String, Codable, CaseIterable, Identifiable {
         case .free: Color.purple
         case .sleep: Color.indigo
         case .other: Color.gray
+        }
+    }
+}
+
+/// Часть суток — для разделения распорядка
+enum DayPart: CaseIterable, Identifiable {
+    case morning, day, evening, night
+
+    var id: String { title }
+
+    static func of(_ minutes: Int) -> DayPart {
+        let m = ((minutes % 1440) + 1440) % 1440
+        switch m {
+        case 240..<720: return .morning
+        case 720..<1080: return .day
+        case 1080..<1440: return .evening
+        default: return .night
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .morning: "Утро"
+        case .day: "День"
+        case .evening: "Вечер"
+        case .night: "Ночь"
+        }
+    }
+
+    var range: String {
+        switch self {
+        case .morning: "04:00 – 12:00"
+        case .day: "12:00 – 18:00"
+        case .evening: "18:00 – 24:00"
+        case .night: "00:00 – 04:00"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .morning: "sunrise.fill"
+        case .day: "sun.max.fill"
+        case .evening: "sunset.fill"
+        case .night: "moon.stars.fill"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .morning: Color.orange
+        case .day: Color.yellow
+        case .evening: Color.pink
+        case .night: Color.indigo
         }
     }
 }
@@ -281,10 +340,11 @@ final class RemindersService {
         }
     }
 
-    func update(id: String?, title: String? = nil, done: Bool? = nil) {
+    func update(id: String?, title: String? = nil, done: Bool? = nil, date: Date? = nil) {
         guard tasksOn, let r = reminder(id) else { return }
         if let title { r.title = title }
         if let done { r.isCompleted = done }
+        if let date { r.dueDateComponents = cal.dateComponents([.year, .month, .day], from: date) }
         try? eventStore.save(r, commit: true)
     }
 
@@ -293,7 +353,7 @@ final class RemindersService {
         try? eventStore.remove(r, commit: true)
     }
 
-    // Распорядок: повторяющиеся напоминания со звуковым сигналом в момент начала
+    // Распорядок: повторяющиеся напоминания с сигналом в момент начала
 
     func syncRoutine(_ item: ScheduleItem) -> String? {
         guard routineOn, hasAccess, let lst = routineList else { return nil }
@@ -406,16 +466,25 @@ final class Store: ObservableObject {
         save()
     }
 
-    // To-Do
+    // To-Do (невыполненные сверху, выполненные внизу)
 
     func todos(on date: Date) -> [TodoItem] {
-        todos.filter { cal.isDate($0.date, inSameDayAs: date) }
+        let all = todos.filter { cal.isDate($0.date, inSameDayAs: date) }
+        return all.filter { !$0.isDone } + all.filter { $0.isDone }
     }
 
     func addTodo(_ title: String, on date: Date) {
         let day = date.startOfDay
         let rid = reminders.create(title: title, date: day)
         todos.append(TodoItem(title: title, date: day, reminderID: rid))
+        save()
+    }
+
+    func updateTodo(_ todo: TodoItem, title: String, date: Date) {
+        guard let i = todos.firstIndex(where: { $0.id == todo.id }) else { return }
+        todos[i].title = title
+        todos[i].date = date.startOfDay
+        reminders.update(id: todos[i].reminderID, title: title, date: todos[i].date)
         save()
     }
 
@@ -549,67 +618,114 @@ final class Store: ObservableObject {
     }
 }
 
-// MARK: - Фон (сетка-градиент, чтобы стекло было видно)
+// MARK: - Свайп между вкладками
+//
+// Свой «пейджер» вместо TabView(.page): так горизонтальный свайп по строке задач
+// остаётся системному swipeActions (удаление), а между вкладками листается
+// по всему остальному экрану. Полоса недели листается сама.
 
-struct AppBackground: View {
-    @Environment(\.colorScheme) private var scheme
-    @Environment(\.brand) private var brand
+struct PagerHandlers {
+    var onDrag: (CGFloat) -> Void = { _ in }
+    var onEnd: (CGFloat, CGFloat) -> Void = { _, _ in }
+}
 
-    var body: some View {
-        let dark = scheme == .dark
-        let base = dark
-            ? Color(red: 0.04, green: 0.05, blue: 0.09)
-            : Color(red: 0.95, green: 0.96, blue: 0.99)
-        let k: Double = dark ? 0.45 : 0.6
-        let a = brand.mix(with: base, by: k)
-        let b = Color.purple.mix(with: base, by: k + 0.1)
-        let c = Color.orange.mix(with: base, by: k + 0.15)
+private struct PagerKey: EnvironmentKey {
+    static let defaultValue = PagerHandlers()
+}
 
-        MeshGradient(
-            width: 3, height: 3,
-            points: [
-                [0.0, 0.0], [0.5, 0.0], [1.0, 0.0],
-                [0.0, 0.5], [0.6, 0.4], [1.0, 0.5],
-                [0.0, 1.0], [0.5, 1.0], [1.0, 1.0]
-            ],
-            colors: [a, base, b, base, a, base, c, base, a]
-        )
-        .ignoresSafeArea()
+extension EnvironmentValues {
+    var pager: PagerHandlers {
+        get { self[PagerKey.self] }
+        set { self[PagerKey.self] = newValue }
+    }
+}
+
+/// Вертикальная полоса экрана, занятая полосой недели
+struct StripBandKey: PreferenceKey {
+    static let defaultValue: ClosedRange<CGFloat>? = nil
+    static func reduce(value: inout ClosedRange<CGFloat>?, nextValue: () -> ClosedRange<CGFloat>?) {
+        value = nextValue() ?? value
+    }
+}
+
+struct PagerSwipe: ViewModifier {
+    let index: Int
+    @Environment(\.pager) private var pager
+    @State private var band: ClosedRange<CGFloat>?
+    @State private var horizontal: Bool?
+    @State private var ignored = false
+
+    func body(content: Content) -> some View {
+        content
+            .contentShape(Rectangle())
+            .coordinateSpace(.named("page"))
+            .onPreferenceChange(StripBandKey.self) { band = $0 }
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 12)
+                    .onChanged { v in
+                        if horizontal == nil {
+                            horizontal = abs(v.translation.width) > abs(v.translation.height)
+                            ignored = shouldIgnore(v)
+                        }
+                        if horizontal == true, !ignored {
+                            pager.onDrag(v.translation.width)
+                        }
+                    }
+                    .onEnded { v in
+                        let active = horizontal == true && !ignored
+                        horizontal = nil
+                        ignored = false
+                        if active {
+                            pager.onEnd(v.translation.width, v.predictedEndTranslation.width)
+                        }
+                    }
+            )
+    }
+
+    private func shouldIgnore(_ v: DragGesture.Value) -> Bool {
+        // свайп по полосе недели — листает неделю, а не вкладки
+        if let band, band.contains(v.startLocation.y) { return true }
+        // на вкладке задач свайп влево — удаление строки
+        if index == 2, v.translation.width < 0 { return true }
+        return false
     }
 }
 
 extension View {
-    func appBackground() -> some View {
-        background { AppBackground() }
-    }
-
-    /// Строка списка без фона и разделителей (под стеклянную карточку)
-    func glassRow() -> some View {
-        listRowSeparator(.hidden)
-            .listRowBackground(Color.clear)
-            .listRowInsets(EdgeInsets(top: 4, leading: 14, bottom: 4, trailing: 14))
+    func pagerSwipe(_ index: Int) -> some View {
+        modifier(PagerSwipe(index: index))
     }
 }
 
-// MARK: - Корневой экран: 3 вкладки со свайпом
+// MARK: - Корневой экран: 3 вкладки
 
 struct RootView: View {
     @EnvironmentObject private var store: Store
     @Environment(\.scenePhase) private var phase
     @State private var tab = 1   // по умолчанию — центральная
+    @State private var dragX: CGFloat = 0
+    @State private var width: CGFloat = 390
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            TabView(selection: $tab) {
-                CalendarTab().tag(0)   // свайп вправо
-                ScheduleTab().tag(1)
-                TodoTab().tag(2)       // свайп влево
+            GeometryReader { geo in
+                let w = geo.size.width
+                HStack(spacing: 0) {
+                    CalendarTab().frame(width: w)   // свайп вправо
+                    ScheduleTab().frame(width: w)
+                    TodoTab().frame(width: w)       // свайп влево
+                }
+                .frame(width: w * 3, height: geo.size.height, alignment: .leading)
+                .offset(x: -CGFloat(tab) * w + dragX)
+                .onAppear { width = w }
+                .onChange(of: w) { _, new in width = new }
             }
-            .tabViewStyle(.page(indexDisplayMode: .never))
+            .clipped()
             .ignoresSafeArea(.container, edges: .bottom)
 
             GlassTabBar(selection: $tab)
         }
+        .environment(\.pager, PagerHandlers(onDrag: drag, onEnd: settle))
         .sensoryFeedback(.selection, trigger: tab)
         .task { await store.pullReminders() }
         .onChange(of: phase) { _, new in
@@ -619,9 +735,27 @@ struct RootView: View {
             Task { await store.pullReminders() }
         }
     }
+
+    private func drag(_ dx: CGFloat) {
+        let atEdge = (tab == 0 && dx > 0) || (tab == 2 && dx < 0)
+        dragX = atEdge ? dx / 4 : dx
+    }
+
+    private func settle(_ dx: CGFloat, _ predicted: CGFloat) {
+        var new = tab
+        if dx < -width * 0.25 || predicted < -width * 0.5 {
+            new = min(tab + 1, 2)
+        } else if dx > width * 0.25 || predicted > width * 0.5 {
+            new = max(tab - 1, 0)
+        }
+        withAnimation(.snappy) {
+            tab = new
+            dragX = 0
+        }
+    }
 }
 
-/// Нижний переключатель: стеклянная капсула, выбранная вкладка — «жидкая» стеклянная таблетка
+/// Нижний переключатель: стеклянная капсула с «таблеткой» выбранной вкладки
 struct GlassTabBar: View {
     @Binding var selection: Int
     @Namespace private var ns
@@ -634,38 +768,36 @@ struct GlassTabBar: View {
     ]
 
     var body: some View {
-        GlassEffectContainer(spacing: 12) {
-            HStack(spacing: 0) {
-                ForEach(items.indices, id: \.self) { i in
-                    let selected = selection == i
-                    Button {
-                        withAnimation(.bouncy(duration: 0.45)) { selection = i }
-                    } label: {
-                        VStack(spacing: 3) {
-                            Image(systemName: items[i].icon)
-                                .font(.system(size: 20, weight: .semibold))
-                                .symbolVariant(selected ? .fill : .none)
-                            Text(items[i].title)
-                                .font(.caption2.weight(.semibold))
-                        }
-                        .foregroundStyle(selected ? brand : Color.primary.opacity(0.7))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 8)
-                        .background {
-                            if selected {
-                                Color.clear
-                                    .glassEffect(.regular.tint(brand.opacity(0.28)).interactive(), in: .capsule)
-                                    .glassEffectID("selected", in: ns)
-                            }
-                        }
-                        .contentShape(Capsule())
+        HStack(spacing: 0) {
+            ForEach(items.indices, id: \.self) { i in
+                let selected = selection == i
+                Button {
+                    withAnimation(.snappy) { selection = i }
+                } label: {
+                    VStack(spacing: 3) {
+                        Image(systemName: items[i].icon)
+                            .font(.system(size: 20, weight: .semibold))
+                            .symbolVariant(selected ? .fill : .none)
+                        Text(items[i].title)
+                            .font(.caption2.weight(.semibold))
                     }
-                    .buttonStyle(.plain)
+                    .foregroundStyle(selected ? brand : Color.primary.opacity(0.7))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .background {
+                        if selected {
+                            Capsule()
+                                .fill(brand.opacity(0.16))
+                                .matchedGeometryEffect(id: "pill", in: ns)
+                        }
+                    }
+                    .contentShape(Capsule())
                 }
+                .buttonStyle(.plain)
             }
-            .padding(5)
-            .glassEffect(.regular, in: .capsule)
         }
+        .padding(5)
+        .glassEffect(.regular.interactive(), in: .capsule)
         .padding(.horizontal, 20)
         .padding(.bottom, 4)
     }
@@ -747,6 +879,12 @@ struct WeekStrip: View {
             .scrollClipDisabled()
         }
         .padding(.vertical, 8)
+        .background {
+            GeometryReader { g in
+                let f = g.frame(in: .named("page"))
+                Color.clear.preference(key: StripBandKey.self, value: f.minY...f.maxY)
+            }
+        }
         .sensoryFeedback(.selection, trigger: weekIndex)
         .onChange(of: weekIndex) { _, new in
             // неделю пролистали — выбираем тот же день недели в новой неделе
@@ -819,36 +957,56 @@ struct ScheduleTab: View {
     @EnvironmentObject private var store: Store
     @State private var date = Date().startOfDay
     @State private var editor: EditorTarget?
+    @State private var now = Date()
+
+    private let ticker = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
 
     var body: some View {
         let items = store.items(forWeekday: date.weekday)
+        let nowID = currentID(in: items)
 
         NavigationStack {
             VStack(spacing: 0) {
                 WeekStrip(date: $date)
 
                 List {
-                    ForEach(items) { item in
-                        Button {
-                            editor = EditorTarget(item: item, weekday: date.weekday)
-                        } label: {
-                            ScheduleRow(item: item, card: true)
-                        }
-                        .buttonStyle(.plain)
-                        .glassRow()
-                        .swipeActions(edge: .trailing) {
-                            Button(role: .destructive) {
-                                store.remove(item, fromWeekday: date.weekday)
-                            } label: {
-                                Label("Убрать", systemImage: "trash")
+                    ForEach(DayPart.allCases) { part in
+                        let rows = items.filter { DayPart.of($0.start) == part }
+                        if !rows.isEmpty {
+                            Section {
+                                ForEach(rows) { item in
+                                    Button {
+                                        editor = EditorTarget(item: item, weekday: date.weekday)
+                                    } label: {
+                                        ScheduleRow(item: item, isNow: item.id == nowID)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .contextMenu {
+                                        Button {
+                                            editor = EditorTarget(item: item, weekday: date.weekday)
+                                        } label: {
+                                            Label("Изменить", systemImage: "pencil")
+                                        }
+                                        Button(role: .destructive) {
+                                            withAnimation { store.remove(item, fromWeekday: date.weekday) }
+                                        } label: {
+                                            Label("Убрать из этого дня", systemImage: "calendar.badge.minus")
+                                        }
+                                        Button(role: .destructive) {
+                                            withAnimation { store.removeEverywhere(item) }
+                                        } label: {
+                                            Label("Удалить из всех дней", systemImage: "trash")
+                                        }
+                                    }
+                                }
+                            } header: {
+                                PartHeader(part: part)
                             }
                         }
                     }
                 }
                 .listStyle(.plain)
-                .scrollContentBackground(.hidden)
                 .contentMargins(.bottom, 100, for: .scrollContent)
-                .scrollEdgeEffectStyle(.soft, for: .bottom)
                 .overlay {
                     if items.isEmpty {
                         ContentUnavailableView(
@@ -859,7 +1017,7 @@ struct ScheduleTab: View {
                     }
                 }
             }
-            .appBackground()
+            .pagerSwipe(1)
             .navigationTitle(Fmt.string(date, "EEEE").capFirst)
             .navigationSubtitle(Fmt.string(date, "d MMMM"))
             .navigationBarTitleDisplayMode(.inline)
@@ -869,6 +1027,7 @@ struct ScheduleTab: View {
                     Button("Сегодня") {
                         withAnimation(.snappy) { date = Date().startOfDay }
                     }
+                    .disabled(cal.isDateInToday(date))
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -882,25 +1041,42 @@ struct ScheduleTab: View {
         .sheet(item: $editor) { target in
             ScheduleEditor(item: target.item, weekday: target.weekday)
         }
+        .onReceive(ticker) { now = $0 }
+    }
+
+    /// Какой пункт идёт «сейчас» (только для сегодняшнего дня)
+    private func currentID(in items: [ScheduleItem]) -> UUID? {
+        guard cal.isDateInToday(date) else { return nil }
+        let m = now.minutesOfDay
+        return items.last(where: { $0.start <= m })?.id
+    }
+}
+
+struct PartHeader: View {
+    let part: DayPart
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: part.icon)
+                .foregroundStyle(part.color)
+            Text(part.title)
+                .font(.subheadline.weight(.semibold))
+            Spacer()
+            Text(part.range)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .textCase(nil)
     }
 }
 
 struct ScheduleRow: View {
+    @Environment(\.brand) private var brand
     let item: ScheduleItem
-    var card = false
+    var isNow = false
 
     var body: some View {
-        if card {
-            content
-                .padding(12)
-                .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 22))
-        } else {
-            content
-        }
-    }
-
-    private var content: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 14) {
             VStack(alignment: .trailing, spacing: 2) {
                 Text(Fmt.time(item.start))
                     .font(.subheadline.weight(.semibold).monospacedDigit())
@@ -933,7 +1109,17 @@ struct ScheduleRow: View {
             }
 
             Spacer(minLength: 0)
+
+            if isNow {
+                Text("Сейчас")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(brand)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(brand.opacity(0.16), in: .capsule)
+            }
         }
+        .padding(.vertical, 4)
         .contentShape(Rectangle())
     }
 
@@ -951,6 +1137,7 @@ struct ScheduleEditor: View {
     @EnvironmentObject private var store: Store
     @Environment(\.dismiss) private var dismiss
     @Environment(\.brand) private var brand
+    @FocusState private var focused: Bool
 
     private let original: ScheduleItem?
     @State private var title: String
@@ -974,7 +1161,16 @@ struct ScheduleEditor: View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("Название", text: $title)
+                    HStack(spacing: 12) {
+                        Image(systemName: kind.icon)
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .frame(width: 36, height: 36)
+                            .background(kind.color.gradient, in: .circle)
+                        TextField("Название", text: $title)
+                            .focused($focused)
+                            .submitLabel(.done)
+                    }
                 }
 
                 Section("Категория") {
@@ -992,8 +1188,10 @@ struct ScheduleEditor: View {
                                 .buttonStyle(.plain)
                             }
                         }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
                     }
-                    .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+                    .listRowInsets(EdgeInsets())
                 }
 
                 Section("Время") {
@@ -1003,9 +1201,12 @@ struct ScheduleEditor: View {
                             Text(d == 0 ? "Без длительности" : durationText(d)).tag(d)
                         }
                     }
+                    if duration > 0 {
+                        LabeledContent("Окончание", value: Fmt.time(time.minutesOfDay + duration))
+                    }
                 }
 
-                Section("Повторять по дням") {
+                Section {
                     HStack(spacing: 6) {
                         ForEach(weekdayOrder, id: \.self) { wd in
                             let on = weekdays.contains(wd)
@@ -1025,15 +1226,23 @@ struct ScheduleEditor: View {
                             .buttonStyle(.plain)
                         }
                     }
-                    .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+                    .padding(.vertical, 4)
 
-                    HStack {
+                    HStack(spacing: 8) {
                         Button("Каждый день") { weekdays = Set(1...7) }
                         Button("Будни") { weekdays = [2, 3, 4, 5, 6] }
                         Button("Выходные") { weekdays = [1, 7] }
+                        Spacer(minLength: 0)
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                } header: {
+                    Text("Повторять по дням")
+                } footer: {
+                    if weekdays.isEmpty {
+                        Text("Выберите хотя бы один день")
+                            .foregroundStyle(.red)
+                    }
                 }
 
                 if let original {
@@ -1045,6 +1254,7 @@ struct ScheduleEditor: View {
                     }
                 }
             }
+            .scrollDismissesKeyboard(.interactively)
             .navigationTitle(original == nil ? "Новый пункт" : "Изменить")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -1056,6 +1266,7 @@ struct ScheduleEditor: View {
                         .disabled(!canSave)
                 }
             }
+            .onAppear { if original == nil { focused = true } }
         }
     }
 
@@ -1070,15 +1281,12 @@ struct ScheduleEditor: View {
     }
 
     private func save() {
-        let comps = cal.dateComponents([.hour, .minute], from: time)
-        let start = (comps.hour ?? 0) * 60 + (comps.minute ?? 0)
-
         var item = original ?? ScheduleItem(
-            title: "", kind: kind, start: start, duration: duration, weekdays: weekdays
+            title: "", kind: kind, start: time.minutesOfDay, duration: duration, weekdays: weekdays
         )
         item.title = title.trimmingCharacters(in: .whitespaces)
         item.kind = kind
-        item.start = start
+        item.start = time.minutesOfDay
         item.duration = duration
         item.weekdays = weekdays
 
@@ -1093,10 +1301,15 @@ struct ScheduleEditor: View {
 
 // MARK: - Правая вкладка: To-Do
 
+struct TodoSheetTarget: Identifiable {
+    let id = UUID()
+    var todo: TodoItem?
+}
+
 struct TodoTab: View {
     @EnvironmentObject private var store: Store
     @State private var date = Date().startOfDay
-    @State private var adding = false
+    @State private var sheet: TodoSheetTarget?
 
     var body: some View {
         let todos = store.todos(on: date)
@@ -1108,26 +1321,44 @@ struct TodoTab: View {
 
                 List {
                     if !todos.isEmpty {
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                Text("Выполнено")
-                                    .font(.subheadline.weight(.semibold))
-                                Spacer()
-                                Text("\(done) из \(todos.count)")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.secondary)
+                        Section {
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack {
+                                    Text("Выполнено")
+                                        .font(.subheadline.weight(.semibold))
+                                    Spacer()
+                                    Text("\(done) из \(todos.count)")
+                                        .font(.subheadline)
+                                        .foregroundStyle(.secondary)
+                                }
+                                ProgressView(value: Double(done), total: Double(todos.count))
                             }
-                            ProgressView(value: Double(done), total: Double(todos.count))
+                            .padding(.vertical, 4)
                         }
-                        .padding(14)
-                        .glassEffect(.regular, in: .rect(cornerRadius: 22))
-                        .glassRow()
                     }
 
                     ForEach(todos) { todo in
-                        TodoRow(todo: todo, card: true)
-                            .glassRow()
-                            .swipeActions(edge: .trailing) {
+                        TodoRow(todo: todo)
+                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                Button(role: .destructive) {
+                                    withAnimation { store.delete(todo) }
+                                } label: {
+                                    Label("Удалить", systemImage: "trash")
+                                }
+                            }
+                            .contextMenu {
+                                Button {
+                                    sheet = TodoSheetTarget(todo: todo)
+                                } label: {
+                                    Label("Изменить", systemImage: "pencil")
+                                }
+                                Button {
+                                    withAnimation {
+                                        store.updateTodo(todo, title: todo.title, date: todo.date.addingDays(1))
+                                    }
+                                } label: {
+                                    Label("Перенести на следующий день", systemImage: "calendar.badge.plus")
+                                }
                                 Button(role: .destructive) {
                                     withAnimation { store.delete(todo) }
                                 } label: {
@@ -1136,10 +1367,7 @@ struct TodoTab: View {
                             }
                     }
                 }
-                .listStyle(.plain)
-                .scrollContentBackground(.hidden)
                 .contentMargins(.bottom, 100, for: .scrollContent)
-                .scrollEdgeEffectStyle(.soft, for: .bottom)
                 .overlay {
                     if todos.isEmpty {
                         ContentUnavailableView(
@@ -1150,7 +1378,7 @@ struct TodoTab: View {
                     }
                 }
             }
-            .appBackground()
+            .pagerSwipe(2)
             .navigationTitle(cal.isDateInToday(date) ? "Сегодня" : Fmt.string(date, "EEEE").capFirst)
             .navigationSubtitle(Fmt.string(date, "d MMMM"))
             .navigationBarTitleDisplayMode(.inline)
@@ -1160,16 +1388,19 @@ struct TodoTab: View {
                     Button("Сегодня") {
                         withAnimation(.snappy) { date = Date().startOfDay }
                     }
+                    .disabled(cal.isDateInToday(date))
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button { adding = true } label: {
+                    Button {
+                        sheet = TodoSheetTarget(todo: nil)
+                    } label: {
                         Label("Добавить", systemImage: "plus")
                     }
                 }
             }
         }
-        .sheet(isPresented: $adding) {
-            AddTodoSheet(date: date)
+        .sheet(item: $sheet) { target in
+            TodoEditor(date: date, editing: target.todo)
         }
     }
 }
@@ -1177,47 +1408,44 @@ struct TodoTab: View {
 struct TodoRow: View {
     @EnvironmentObject private var store: Store
     let todo: TodoItem
-    var card = false
 
     var body: some View {
         Button {
             withAnimation(.snappy) { store.toggle(todo) }
         } label: {
-            if card {
-                content
-                    .padding(12)
-                    .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 22))
-            } else {
-                content
+            HStack(spacing: 12) {
+                Image(systemName: todo.isDone ? "checkmark.circle.fill" : "circle")
+                    .font(.title2)
+                    .foregroundStyle(todo.isDone ? Color.green : Color.secondary)
+                    .contentTransition(.symbolEffect(.replace))
+                Text(todo.title)
+                    .strikethrough(todo.isDone)
+                    .foregroundStyle(todo.isDone ? .secondary : .primary)
+                Spacer(minLength: 0)
             }
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .sensoryFeedback(.selection, trigger: todo.isDone)
     }
-
-    private var content: some View {
-        HStack(spacing: 12) {
-            Image(systemName: todo.isDone ? "checkmark.circle.fill" : "circle")
-                .font(.title2)
-                .foregroundStyle(todo.isDone ? Color.green : Color.secondary)
-                .contentTransition(.symbolEffect(.replace))
-            Text(todo.title)
-                .strikethrough(todo.isDone)
-                .foregroundStyle(todo.isDone ? .secondary : .primary)
-            Spacer(minLength: 0)
-        }
-        .contentShape(Rectangle())
-    }
 }
 
-/// Окно добавления задачи: по «Добавить» (или Return) задача сохраняется и окно закрывается
-struct AddTodoSheet: View {
+/// Окно новой / редактируемой задачи. По «Добавить» (или Return) закрывается само.
+struct TodoEditor: View {
     @EnvironmentObject private var store: Store
     @Environment(\.dismiss) private var dismiss
-
-    let date: Date
-    @State private var text = ""
+    @Environment(\.brand) private var brand
     @FocusState private var focused: Bool
+
+    private let editing: TodoItem?
+    @State private var text: String
+    @State private var date: Date
+
+    init(date: Date, editing: TodoItem? = nil) {
+        self.editing = editing
+        _text = State(initialValue: editing?.title ?? "")
+        _date = State(initialValue: (editing?.date ?? date).startOfDay)
+    }
 
     private var trimmed: String { text.trimmingCharacters(in: .whitespaces) }
 
@@ -1227,12 +1455,21 @@ struct AddTodoSheet: View {
                 TextField("Что нужно сделать?", text: $text)
                     .focused($focused)
                     .submitLabel(.done)
-                    .onSubmit(add)
+                    .onSubmit(commit)
                     .padding(14)
                     .glassEffect(.regular, in: .rect(cornerRadius: 16))
 
-                Button(action: add) {
-                    Label("Добавить", systemImage: "plus")
+                HStack(spacing: 8) {
+                    quick("Сегодня", Date().startOfDay)
+                    quick("Завтра", Date().startOfDay.addingDays(1))
+                    Spacer(minLength: 0)
+                    DatePicker("Дата", selection: $date, displayedComponents: .date)
+                        .labelsHidden()
+                }
+
+                Button(action: commit) {
+                    Label(editing == nil ? "Добавить" : "Сохранить",
+                          systemImage: editing == nil ? "plus" : "checkmark")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.glassProminent)
@@ -1242,7 +1479,7 @@ struct AddTodoSheet: View {
                 Spacer(minLength: 0)
             }
             .padding()
-            .navigationTitle(Fmt.string(date, "EEEE, d MMMM").capFirst)
+            .navigationTitle(editing == nil ? "Новая задача" : "Изменить задачу")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -1250,13 +1487,26 @@ struct AddTodoSheet: View {
                 }
             }
         }
-        .presentationDetents([.height(240), .medium])
+        .presentationDetents([.height(330), .large])
+        .presentationDragIndicator(.visible)
         .onAppear { focused = true }
     }
 
-    private func add() {
+    private func quick(_ title: String, _ day: Date) -> some View {
+        let on = cal.isDate(date, inSameDayAs: day)
+        return Button(title) { date = day }
+            .buttonStyle(.bordered)
+            .tint(on ? brand : Color.secondary)
+            .controlSize(.small)
+    }
+
+    private func commit() {
         guard !trimmed.isEmpty else { return }
-        store.addTodo(trimmed, on: date)
+        if let editing {
+            store.updateTodo(editing, title: trimmed, date: date)
+        } else {
+            store.addTodo(trimmed, on: date)
+        }
         dismiss()
     }
 }
@@ -1286,11 +1536,10 @@ struct CalendarTab: View {
                     .padding(.top, 8)
                 }
                 .contentMargins(.bottom, 100, for: .scrollContent)
-                .scrollEdgeEffectStyle(.soft, for: .bottom)
                 .onAppear { scrollToCurrent(proxy) }
                 .onChange(of: year) { _, _ in scrollToCurrent(proxy) }
             }
-            .appBackground()
+            .pagerSwipe(0)
             .navigationTitle(String(year))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -1299,6 +1548,7 @@ struct CalendarTab: View {
                     Button("Сегодня") {
                         year = cal.component(.year, from: Date())
                     }
+                    .disabled(year == cal.component(.year, from: Date()))
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Button { year -= 1 } label: { Image(systemName: "chevron.left") }
@@ -1444,7 +1694,7 @@ struct DayDetailSheet: View {
                 Section("Дела") {
                     ForEach(todos) { todo in
                         TodoRow(todo: todo)
-                            .swipeActions(edge: .trailing) {
+                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                                 Button(role: .destructive) {
                                     withAnimation { store.delete(todo) }
                                 } label: {
@@ -1471,6 +1721,7 @@ struct DayDetailSheet: View {
                     }
                 }
             }
+            .scrollDismissesKeyboard(.interactively)
             .navigationTitle(Fmt.string(date, "EEEE, d MMMM").capFirst)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -1572,7 +1823,7 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    LabeledContent("Версия", value: "1.1")
+                    LabeledContent("Версия", value: "1.2")
                 }
             }
             .navigationTitle("Настройки")
