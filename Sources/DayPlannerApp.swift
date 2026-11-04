@@ -1,6 +1,6 @@
 //
 //  DayPlannerApp.swift
-//  Распорядок дня + To-Do  (v1.2, MVP)
+//  Распорядок дня + To-Do  (v1.3)
 //
 //  Требования: Xcode 26+, iOS 26.0+ (Liquid Glass).
 //  Для Напоминаний в Info.plist нужен ключ NSRemindersFullAccessUsageDescription
@@ -8,6 +8,7 @@
 //
 
 import SwiftUI
+import UIKit
 import EventKit
 
 // MARK: - Приложение
@@ -618,82 +619,154 @@ final class Store: ObservableObject {
     }
 }
 
-// MARK: - Свайп между вкладками
+// MARK: - Пейджер вкладок (UIKit)
 //
-// Свой «пейджер» вместо TabView(.page): так горизонтальный свайп по строке задач
-// остаётся системному swipeActions (удаление), а между вкладками листается
-// по всему остальному экрану. Полоса недели листается сама.
+// Нативный постраничный UIScrollView + UIHostingController на каждую вкладку:
+//  • свайп листает вкладки с обычной физикой iOS (инерция, «резинка» по краям);
+//  • полоса недели (свой горизонтальный скролл) листается сама, вкладки не трогает;
+//  • на последней вкладке свайп влево отдаётся строке задачи (удаление).
 
-struct PagerHandlers {
-    var onDrag: (CGFloat) -> Void = { _ in }
-    var onEnd: (CGFloat, CGFloat) -> Void = { _, _ in }
-}
+final class PagingScrollView: UIScrollView {
+    /// Можно ли начинать листание вкладок для жеста с таким смещением по X
+    var allowPaging: ((CGFloat) -> Bool)?
 
-private struct PagerKey: EnvironmentKey {
-    static let defaultValue = PagerHandlers()
-}
-
-extension EnvironmentValues {
-    var pager: PagerHandlers {
-        get { self[PagerKey.self] }
-        set { self[PagerKey.self] = newValue }
-    }
-}
-
-/// Вертикальная полоса экрана, занятая полосой недели
-struct StripBandKey: PreferenceKey {
-    static let defaultValue: ClosedRange<CGFloat>? = nil
-    static func reduce(value: inout ClosedRange<CGFloat>?, nextValue: () -> ClosedRange<CGFloat>?) {
-        value = nextValue() ?? value
-    }
-}
-
-struct PagerSwipe: ViewModifier {
-    let index: Int
-    @Environment(\.pager) private var pager
-    @State private var band: ClosedRange<CGFloat>?
-    @State private var horizontal: Bool?
-    @State private var ignored = false
-
-    func body(content: Content) -> some View {
-        content
-            .contentShape(Rectangle())
-            .coordinateSpace(.named("page"))
-            .onPreferenceChange(StripBandKey.self) { band = $0 }
-            .simultaneousGesture(
-                DragGesture(minimumDistance: 12)
-                    .onChanged { v in
-                        if horizontal == nil {
-                            horizontal = abs(v.translation.width) > abs(v.translation.height)
-                            ignored = shouldIgnore(v)
-                        }
-                        if horizontal == true, !ignored {
-                            pager.onDrag(v.translation.width)
-                        }
-                    }
-                    .onEnded { v in
-                        let active = horizontal == true && !ignored
-                        horizontal = nil
-                        ignored = false
-                        if active {
-                            pager.onEnd(v.translation.width, v.predictedEndTranslation.width)
-                        }
-                    }
-            )
+    override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard gestureRecognizer === panGestureRecognizer else {
+            return super.gestureRecognizerShouldBegin(gestureRecognizer)
+        }
+        let t = panGestureRecognizer.translation(in: self)
+        let v = panGestureRecognizer.velocity(in: self)
+        let dx = t.x != 0 ? t.x : v.x
+        let dy = t.y != 0 ? t.y : v.y
+        guard abs(dx) > abs(dy) else { return false }
+        if hasNestedHorizontalScroll(at: panGestureRecognizer.location(in: self)) { return false }
+        if let allowPaging, !allowPaging(dx) { return false }
+        return super.gestureRecognizerShouldBegin(gestureRecognizer)
     }
 
-    private func shouldIgnore(_ v: DragGesture.Value) -> Bool {
-        // свайп по полосе недели — листает неделю, а не вкладки
-        if let band, band.contains(v.startLocation.y) { return true }
-        // на вкладке задач свайп влево — удаление строки
-        if index == 2, v.translation.width < 0 { return true }
+    private func hasNestedHorizontalScroll(at point: CGPoint) -> Bool {
+        var view = hitTest(point, with: nil)
+        while let current = view, current !== self {
+            if let scroll = current as? UIScrollView, scroll.contentSize.width > scroll.bounds.width + 1 {
+                return true
+            }
+            view = current.superview
+        }
         return false
     }
 }
 
-extension View {
-    func pagerSwipe(_ index: Int) -> some View {
-        modifier(PagerSwipe(index: index))
+final class PagerController: UIViewController, UIScrollViewDelegate {
+    private let scrollView = PagingScrollView()
+    private var hosts: [UIHostingController<AnyView>] = []
+    private var lastToken = ""
+    private var isAnimating = false
+
+    var currentPage = 1
+    var onPageChange: ((Int) -> Void)?
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .clear
+        scrollView.isPagingEnabled = true
+        scrollView.showsHorizontalScrollIndicator = false
+        scrollView.showsVerticalScrollIndicator = false
+        scrollView.contentInsetAdjustmentBehavior = .never
+        scrollView.isDirectionalLockEnabled = true
+        scrollView.delaysContentTouches = false
+        scrollView.delegate = self
+        scrollView.allowPaging = { [weak self] dx in
+            guard let self else { return true }
+            // последняя вкладка: свайп влево — удаление строки, а не листание
+            return !(self.currentPage == self.hosts.count - 1 && dx < 0)
+        }
+        view.addSubview(scrollView)
+    }
+
+    func apply(pages: [AnyView], token: String) {
+        loadViewIfNeeded()
+        if hosts.isEmpty {
+            for page in pages {
+                let host = UIHostingController(rootView: page)
+                host.view.backgroundColor = .clear
+                addChild(host)
+                scrollView.addSubview(host.view)
+                host.didMove(toParent: self)
+                hosts.append(host)
+            }
+            lastToken = token
+            view.setNeedsLayout()
+        } else if token != lastToken {
+            lastToken = token
+            for (host, page) in zip(hosts, pages) { host.rootView = page }
+        }
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        let w = view.bounds.width
+        let h = view.bounds.height
+        guard w > 0 else { return }
+        scrollView.frame = view.bounds
+        scrollView.contentSize = CGSize(width: w * CGFloat(hosts.count), height: h)
+        for (i, host) in hosts.enumerated() {
+            host.view.frame = CGRect(x: CGFloat(i) * w, y: 0, width: w, height: h)
+        }
+        if !scrollView.isTracking, !scrollView.isDecelerating, !isAnimating {
+            scrollView.contentOffset = CGPoint(x: CGFloat(currentPage) * w, y: 0)
+        }
+    }
+
+    /// Переход на вкладку (нажатие в нижней панели)
+    func goTo(_ page: Int, animated: Bool) {
+        guard page != currentPage, hosts.indices.contains(page) else { return }
+        currentPage = page
+        let w = view.bounds.width
+        guard w > 0 else { return }
+        isAnimating = animated
+        scrollView.setContentOffset(CGPoint(x: CGFloat(page) * w, y: 0), animated: animated)
+    }
+
+    func scrollViewDidScroll(_ sv: UIScrollView) {
+        guard sv.isTracking || sv.isDecelerating else { return }
+        let w = view.bounds.width
+        guard w > 0 else { return }
+        let page = max(0, min(hosts.count - 1, Int((sv.contentOffset.x / w).rounded())))
+        if page != currentPage {
+            currentPage = page
+            onPageChange?(page)
+        }
+    }
+
+    func scrollViewDidEndScrollingAnimation(_ sv: UIScrollView) {
+        isAnimating = false
+    }
+}
+
+struct PagerView: UIViewControllerRepresentable {
+    @Binding var selection: Int
+    let pages: [AnyView]
+    let token: String
+
+    func makeUIViewController(context: Context) -> PagerController {
+        let vc = PagerController()
+        vc.currentPage = selection
+        vc.onPageChange = changeHandler()
+        vc.apply(pages: pages, token: token)
+        return vc
+    }
+
+    func updateUIViewController(_ vc: PagerController, context: Context) {
+        vc.onPageChange = changeHandler()
+        vc.apply(pages: pages, token: token)
+        vc.goTo(selection, animated: true)
+    }
+
+    private func changeHandler() -> (Int) -> Void {
+        let binding = $selection
+        return { page in
+            withAnimation(.snappy) { binding.wrappedValue = page }
+        }
     }
 }
 
@@ -702,30 +775,21 @@ extension View {
 struct RootView: View {
     @EnvironmentObject private var store: Store
     @Environment(\.scenePhase) private var phase
+    @AppStorage("theme") private var theme = 0
+    @AppStorage("accent") private var accent = 0
     @State private var tab = 1   // по умолчанию — центральная
-    @State private var dragX: CGFloat = 0
-    @State private var width: CGFloat = 390
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            GeometryReader { geo in
-                let w = geo.size.width
-                HStack(spacing: 0) {
-                    CalendarTab().frame(width: w)   // свайп вправо
-                    ScheduleTab().frame(width: w)
-                    TodoTab().frame(width: w)       // свайп влево
-                }
-                .frame(width: w * 3, height: geo.size.height, alignment: .leading)
-                .offset(x: -CGFloat(tab) * w + dragX)
-                .onAppear { width = w }
-                .onChange(of: w) { _, new in width = new }
-            }
-            .clipped()
-            .ignoresSafeArea(.container, edges: .bottom)
+            PagerView(
+                selection: $tab,
+                pages: [page(CalendarTab()), page(ScheduleTab()), page(TodoTab())],
+                token: "\(theme)-\(accent)"
+            )
+            .ignoresSafeArea()
 
             GlassTabBar(selection: $tab)
         }
-        .environment(\.pager, PagerHandlers(onDrag: drag, onEnd: settle))
         .sensoryFeedback(.selection, trigger: tab)
         .task { await store.pullReminders() }
         .onChange(of: phase) { _, new in
@@ -736,22 +800,18 @@ struct RootView: View {
         }
     }
 
-    private func drag(_ dx: CGFloat) {
-        let atEdge = (tab == 0 && dx > 0) || (tab == 2 && dx < 0)
-        dragX = atEdge ? dx / 4 : dx
-    }
-
-    private func settle(_ dx: CGFloat, _ predicted: CGFloat) {
-        var new = tab
-        if dx < -width * 0.25 || predicted < -width * 0.5 {
-            new = min(tab + 1, 2)
-        } else if dx > width * 0.25 || predicted > width * 0.5 {
-            new = max(tab - 1, 0)
-        }
-        withAnimation(.snappy) {
-            tab = new
-            dragX = 0
-        }
+    /// Каждая вкладка живёт в своём UIHostingController — окружение передаём вручную
+    private func page<V: View>(_ view: V) -> AnyView {
+        let color = Palette.color(accent)
+        return AnyView(
+            view
+                .environmentObject(store)
+                .environment(\.locale, Locale(identifier: "ru_RU"))
+                .environment(\.calendar, Calendar.planner)
+                .environment(\.brand, color)
+                .tint(color)
+                .preferredColorScheme(Palette.scheme(theme))
+        )
     }
 }
 
@@ -822,6 +882,7 @@ struct WeekStrip: View {
     @Binding var date: Date
     @Environment(\.brand) private var brand
     @State private var weekIndex: Int?
+    @ScaledMetric(relativeTo: .title3) private var chipHeight: CGFloat = 68
 
     private static let base = Date().weekStart
     private static let range = -156...156   // ±3 года
@@ -877,14 +938,9 @@ struct WeekStrip: View {
             .scrollPosition(id: $weekIndex, anchor: .leading)
             .scrollIndicators(.hidden)
             .scrollClipDisabled()
+            .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.vertical, 8)
-        .background {
-            GeometryReader { g in
-                let f = g.frame(in: .named("page"))
-                Color.clear.preference(key: StripBandKey.self, value: f.minY...f.maxY)
-            }
-        }
         .sensoryFeedback(.selection, trigger: weekIndex)
         .onChange(of: weekIndex) { _, new in
             // неделю пролистали — выбираем тот же день недели в новой неделе
@@ -934,7 +990,7 @@ struct WeekStrip: View {
             }
             .foregroundStyle(selected ? Color.white : Color.primary)
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 8)
+            .frame(height: chipHeight)
         }
         .buttonStyle(.plain)
         .glassEffect(glass, in: .rect(cornerRadius: 18))
@@ -1017,19 +1073,18 @@ struct ScheduleTab: View {
                     }
                 }
             }
-            .pagerSwipe(1)
             .navigationTitle(Fmt.string(date, "EEEE").capFirst)
             .navigationSubtitle(Fmt.string(date, "d MMMM"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItemGroup(placement: .topBarLeading) {
+                ToolbarItem(placement: .topBarLeading) {
                     SettingsButton()
+                }
+                ToolbarItemGroup(placement: .topBarTrailing) {
                     Button("Сегодня") {
                         withAnimation(.snappy) { date = Date().startOfDay }
                     }
                     .disabled(cal.isDateInToday(date))
-                }
-                ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         editor = EditorTarget(item: nil, weekday: date.weekday)
                     } label: {
@@ -1378,19 +1433,18 @@ struct TodoTab: View {
                     }
                 }
             }
-            .pagerSwipe(2)
             .navigationTitle(cal.isDateInToday(date) ? "Сегодня" : Fmt.string(date, "EEEE").capFirst)
             .navigationSubtitle(Fmt.string(date, "d MMMM"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItemGroup(placement: .topBarLeading) {
+                ToolbarItem(placement: .topBarLeading) {
                     SettingsButton()
+                }
+                ToolbarItemGroup(placement: .topBarTrailing) {
                     Button("Сегодня") {
                         withAnimation(.snappy) { date = Date().startOfDay }
                     }
                     .disabled(cal.isDateInToday(date))
-                }
-                ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         sheet = TodoSheetTarget(todo: nil)
                     } label: {
@@ -1539,18 +1593,18 @@ struct CalendarTab: View {
                 .onAppear { scrollToCurrent(proxy) }
                 .onChange(of: year) { _, _ in scrollToCurrent(proxy) }
             }
-            .pagerSwipe(0)
             .navigationTitle(String(year))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItemGroup(placement: .topBarLeading) {
+                ToolbarItem(placement: .topBarLeading) {
                     SettingsButton()
-                    Button("Сегодня") {
-                        year = cal.component(.year, from: Date())
-                    }
-                    .disabled(year == cal.component(.year, from: Date()))
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
+                    if year != cal.component(.year, from: Date()) {
+                        Button("Сегодня") {
+                            year = cal.component(.year, from: Date())
+                        }
+                    }
                     Button { year -= 1 } label: { Image(systemName: "chevron.left") }
                     Button { year += 1 } label: { Image(systemName: "chevron.right") }
                 }
@@ -1574,6 +1628,8 @@ struct MonthView: View {
     let month: Int
     let onSelect: (Date) -> Void
 
+    private static let rowHeight: CGFloat = 78
+
     private var first: Date {
         cal.date(from: DateComponents(year: year, month: month, day: 1)) ?? Date()
     }
@@ -1586,6 +1642,7 @@ struct MonthView: View {
     var body: some View {
         let offset = (first.weekday - cal.firstWeekday + 7) % 7
         let count = cal.range(of: .day, in: .month, for: first)?.count ?? 30
+        let columns = Array(repeating: GridItem(.flexible(), spacing: 3), count: 7)
 
         VStack(alignment: .leading, spacing: 8) {
             Text(Fmt.string(first, "LLLL").capFirst)
@@ -1593,22 +1650,19 @@ struct MonthView: View {
                 .foregroundStyle(isCurrentMonth ? brand : Color.primary)
                 .padding(.horizontal, 4)
 
-            HStack(spacing: 2) {
+            // заголовок дней недели в той же сетке — колонки совпадают идеально
+            LazyVGrid(columns: columns, spacing: 3) {
                 ForEach(weekdayOrder, id: \.self) { wd in
                     Text(shortWeekday(wd))
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity)
                 }
-            }
-
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: 7), spacing: 2) {
                 ForEach(0..<offset, id: \.self) { _ in
-                    Color.clear.frame(height: 1)
+                    Color.clear.frame(height: Self.rowHeight)
                 }
                 ForEach(1...count, id: \.self) { d in
                     let date = cal.date(from: DateComponents(year: year, month: month, day: d)) ?? first
-                    DayCell(date: date) { onSelect(date) }
+                    DayCell(date: date, height: Self.rowHeight) { onSelect(date) }
                 }
             }
         }
@@ -1619,24 +1673,28 @@ struct DayCell: View {
     @EnvironmentObject private var store: Store
     @Environment(\.brand) private var brand
     let date: Date
+    let height: CGFloat
     let action: () -> Void
 
     var body: some View {
         let todos = store.todos(on: date)
         let isToday = cal.isDateInToday(date)
+        let weekend = date.weekday == 1 || date.weekday == 7
+        let shown = todos.count > 3 ? 2 : todos.count
+        let extra = todos.count - shown
 
         Button(action: action) {
             VStack(spacing: 3) {
                 Text("\(cal.component(.day, from: date))")
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(isToday ? Color.white : Color.primary)
+                    .foregroundStyle(isToday ? Color.white : (weekend ? Color.secondary : Color.primary))
                     .frame(width: 22, height: 22)
                     .background {
                         if isToday { Circle().fill(brand) }
                     }
 
-                VStack(alignment: .leading, spacing: 1) {
-                    ForEach(todos.prefix(3)) { t in
+                VStack(alignment: .leading, spacing: 1.5) {
+                    ForEach(todos.prefix(shown)) { t in
                         Text(t.title)
                             .font(.system(size: 8.5, weight: .medium))
                             .lineLimit(1)
@@ -1649,9 +1707,9 @@ struct DayCell: View {
                                 in: .rect(cornerRadius: 3)
                             )
                     }
-                    if todos.count > 3 {
-                        Text("+\(todos.count - 3)")
-                            .font(.system(size: 8, weight: .semibold))
+                    if extra > 0 {
+                        Text("+\(extra)")
+                            .font(.system(size: 8.5, weight: .semibold))
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 2)
                     }
@@ -1662,7 +1720,8 @@ struct DayCell: View {
             .padding(.top, 4)
             .padding(.horizontal, 2)
             .padding(.bottom, 3)
-            .frame(maxWidth: .infinity, minHeight: 72, alignment: .top)
+            .frame(maxWidth: .infinity)
+            .frame(height: height, alignment: .top)
             .background(.quaternary, in: .rect(cornerRadius: 8))
             .overlay {
                 if isToday {
@@ -1823,7 +1882,7 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    LabeledContent("Версия", value: "1.2")
+                    LabeledContent("Версия", value: "1.3")
                 }
             }
             .navigationTitle("Настройки")
