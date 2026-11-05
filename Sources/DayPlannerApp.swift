@@ -1,6 +1,6 @@
 //
 //  DayPlannerApp.swift
-//  Распорядок дня + To-Do  (v1.3)
+//  Распорядок дня + To-Do  (v1.4)
 //
 //  Требования: Xcode 26+, iOS 26.0+ (Liquid Glass).
 //  Для Напоминаний в Info.plist нужен ключ NSRemindersFullAccessUsageDescription
@@ -75,6 +75,11 @@ extension Calendar {
 }
 
 private let cal = Calendar.planner
+
+extension Notification.Name {
+    /// Нажата плавающая кнопка «+» (object — номер вкладки)
+    static let plannerAdd = Notification.Name("plannerAdd")
+}
 
 /// Порядок дней недели (Calendar.weekday: 1 = Вс, 2 = Пн ... 7 = Сб)
 let weekdayOrder = [2, 3, 4, 5, 6, 7, 1]
@@ -426,7 +431,6 @@ final class Store: ObservableObject {
             schedule = snap.schedule
             todos = snap.todos
         } else {
-            schedule = Self.sample()
             save()
         }
     }
@@ -512,8 +516,7 @@ final class Store: ObservableObject {
         for t in todos { reminders.remove(id: t.reminderID) }
         for s in schedule { reminders.removeRoutine(s) }
         todos = []
-        schedule = Self.sample()
-        for i in schedule.indices { schedule[i].reminderID = reminders.syncRoutine(schedule[i]) }
+        schedule = []
         save()
     }
 
@@ -601,21 +604,6 @@ final class Store: ObservableObject {
         } catch {
             print("Save error:", error)
         }
-    }
-
-    private static func sample() -> [ScheduleItem] {
-        let all = Set(1...7)
-        let work: Set<Int> = [2, 3, 4, 5, 6]
-        return [
-            ScheduleItem(title: "Подъём", kind: .wake, start: 7 * 60, duration: 0, weekdays: all),
-            ScheduleItem(title: "Завтрак", kind: .meal, start: 7 * 60 + 30, duration: 30, weekdays: all),
-            ScheduleItem(title: "Работа", kind: .work, start: 9 * 60, duration: 240, weekdays: work),
-            ScheduleItem(title: "Обед", kind: .meal, start: 13 * 60, duration: 45, weekdays: all),
-            ScheduleItem(title: "Работа", kind: .work, start: 14 * 60, duration: 240, weekdays: work),
-            ScheduleItem(title: "Спорт", kind: .sport, start: 18 * 60 + 30, duration: 60, weekdays: [2, 4, 6]),
-            ScheduleItem(title: "Свободное время", kind: .free, start: 20 * 60, duration: 90, weekdays: all),
-            ScheduleItem(title: "Отбой", kind: .sleep, start: 23 * 60, duration: 0, weekdays: all)
-        ]
     }
 }
 
@@ -788,7 +776,20 @@ struct RootView: View {
             )
             .ignoresSafeArea()
 
-            GlassTabBar(selection: $tab)
+            VStack(spacing: 12) {
+                if tab != 0 {
+                    HStack {
+                        Spacer()
+                        FloatingAddButton(label: tab == 1 ? "Новый пункт" : "Новая задача") {
+                            NotificationCenter.default.post(name: .plannerAdd, object: tab)
+                        }
+                    }
+                    .padding(.horizontal, 20)
+                    .transition(.scale(scale: 0.6).combined(with: .opacity))
+                }
+                GlassTabBar(selection: $tab)
+            }
+            .animation(.snappy, value: tab)
         }
         .sensoryFeedback(.selection, trigger: tab)
         .task { await store.pullReminders() }
@@ -812,6 +813,23 @@ struct RootView: View {
                 .tint(color)
                 .preferredColorScheme(Palette.scheme(theme))
         )
+    }
+}
+
+/// Плавающая кнопка «+» (правый нижний угол, поверх списка, над панелью вкладок)
+struct FloatingAddButton: View {
+    let label: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "plus")
+                .font(.system(size: 22, weight: .semibold))
+                .frame(width: 56, height: 56)
+        }
+        .buttonStyle(.glassProminent)
+        .buttonBorderShape(.circle)
+        .accessibilityLabel(label)
     }
 }
 
@@ -882,7 +900,7 @@ struct WeekStrip: View {
     @Binding var date: Date
     @Environment(\.brand) private var brand
     @State private var weekIndex: Int?
-    @ScaledMetric(relativeTo: .title3) private var chipHeight: CGFloat = 68
+    @Namespace private var ns
 
     private static let base = Date().weekStart
     private static let range = -156...156   // ±3 года
@@ -902,45 +920,21 @@ struct WeekStrip: View {
     }
 
     var body: some View {
-        let days = date.weekDays
-
-        VStack(spacing: 10) {
-            HStack {
-                Button { shift(-7) } label: { Image(systemName: "chevron.left") }
-                    .buttonStyle(.glass)
-                    .buttonBorderShape(.circle)
-                    .controlSize(.small)
-
-                Spacer()
-
-                Text("\(Fmt.string(days[0], "d MMM")) – \(Fmt.string(days[6], "d MMM"))")
-                    .font(.subheadline.weight(.semibold))
-
-                Spacer()
-
-                Button { shift(7) } label: { Image(systemName: "chevron.right") }
-                    .buttonStyle(.glass)
-                    .buttonBorderShape(.circle)
-                    .controlSize(.small)
-            }
-            .padding(.horizontal, 12)
-
-            ScrollView(.horizontal) {
-                LazyHStack(spacing: 0) {
-                    ForEach(Self.range, id: \.self) { i in
-                        weekRow(i)
-                            .containerRelativeFrame(.horizontal)
-                    }
+        ScrollView(.horizontal) {
+            LazyHStack(spacing: 0) {
+                ForEach(Self.range, id: \.self) { i in
+                    weekRow(i)
+                        .containerRelativeFrame(.horizontal)
                 }
-                .scrollTargetLayout()
             }
-            .scrollTargetBehavior(.paging)
-            .scrollPosition(id: $weekIndex, anchor: .leading)
-            .scrollIndicators(.hidden)
-            .scrollClipDisabled()
-            .fixedSize(horizontal: false, vertical: true)
+            .scrollTargetLayout()
         }
-        .padding(.vertical, 8)
+        .scrollTargetBehavior(.paging)
+        .scrollPosition(id: $weekIndex, anchor: .leading)
+        .scrollIndicators(.hidden)
+        .scrollClipDisabled()
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.vertical, 6)
         .sensoryFeedback(.selection, trigger: weekIndex)
         .onChange(of: weekIndex) { _, new in
             // неделю пролистали — выбираем тот же день недели в новой неделе
@@ -949,7 +943,7 @@ struct WeekStrip: View {
             date = Self.start(of: new).addingDays(offset)
         }
         .onChange(of: date) { _, new in
-            // дату сменили (стрелки, «Сегодня») — докручиваем полосу до нужной недели
+            // дату сменили («Сегодня», выбор дня) — докручиваем полосу до нужной недели
             let i = Self.index(of: new)
             if weekIndex != i {
                 withAnimation(.snappy) { weekIndex = i }
@@ -959,45 +953,58 @@ struct WeekStrip: View {
 
     private func weekRow(_ i: Int) -> some View {
         let start = Self.start(of: i)
-        return GlassEffectContainer(spacing: 6) {
-            HStack(spacing: 6) {
+        return GlassEffectContainer(spacing: 0) {
+            HStack(spacing: 0) {
                 ForEach(0..<7, id: \.self) { k in
-                    chip(for: start.addingDays(k))
+                    dayCell(start.addingDays(k))
                 }
             }
         }
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 8)
     }
 
-    private func chip(for day: Date) -> some View {
+    private func dayCell(_ day: Date) -> some View {
         let selected = cal.isDate(day, inSameDayAs: date)
         let isToday = cal.isDateInToday(day)
-        let glass: Glass = selected
-            ? Glass.regular.tint(brand).interactive()
-            : Glass.regular.interactive()
 
         return Button {
             withAnimation(.snappy) { date = day.startOfDay }
         } label: {
-            VStack(spacing: 3) {
-                Text(Fmt.string(day, "EEEEEE").capFirst)
+            VStack(spacing: 6) {
+                Text(Fmt.string(day, "EEEEE").uppercased())
                     .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
                 Text("\(cal.component(.day, from: day))")
-                    .font(.title3.weight(.semibold).monospacedDigit())
-                Circle()
-                    .fill(isToday ? (selected ? Color.white : brand) : Color.clear)
-                    .frame(width: 4, height: 4)
+                    .font(.title3.weight(.medium).monospacedDigit())
+                    .foregroundStyle(selected ? Color.white : (isToday ? brand : Color.primary))
+                    .frame(width: 40, height: 40)
+                    .background {
+                        if selected {
+                            Color.clear
+                                .glassEffect(.regular.tint(brand).interactive(), in: .circle)
+                                .glassEffectID("day", in: ns)
+                        }
+                    }
             }
-            .foregroundStyle(selected ? Color.white : Color.primary)
             .frame(maxWidth: .infinity)
-            .frame(height: chipHeight)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .glassEffect(glass, in: .rect(cornerRadius: 18))
     }
+}
 
-    private func shift(_ days: Int) {
-        withAnimation(.snappy) { date = date.addingDays(days) }
+/// Заголовок по центру панели: месяц мелко сверху, день крупно
+struct DayTitle: View {
+    let date: Date
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Text(Fmt.string(date, "LLLL"))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(cal.isDateInToday(date) ? "Сегодня" : Fmt.string(date, "EEEE, d").capFirst)
+                .font(.title3.weight(.semibold))
+        }
     }
 }
 
@@ -1062,7 +1069,7 @@ struct ScheduleTab: View {
                     }
                 }
                 .listStyle(.plain)
-                .contentMargins(.bottom, 100, for: .scrollContent)
+                .contentMargins(.bottom, 170, for: .scrollContent)
                 .overlay {
                     if items.isEmpty {
                         ContentUnavailableView(
@@ -1073,28 +1080,29 @@ struct ScheduleTab: View {
                     }
                 }
             }
-            .navigationTitle(Fmt.string(date, "EEEE").capFirst)
-            .navigationSubtitle(Fmt.string(date, "d MMMM"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     SettingsButton()
                 }
-                ToolbarItemGroup(placement: .topBarTrailing) {
+                ToolbarItem(placement: .principal) {
+                    DayTitle(date: date)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
                     Button("Сегодня") {
                         withAnimation(.snappy) { date = Date().startOfDay }
                     }
                     .disabled(cal.isDateInToday(date))
-                    Button {
-                        editor = EditorTarget(item: nil, weekday: date.weekday)
-                    } label: {
-                        Label("Добавить", systemImage: "plus")
-                    }
                 }
             }
         }
         .sheet(item: $editor) { target in
             ScheduleEditor(item: target.item, weekday: target.weekday)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .plannerAdd)) { note in
+            if (note.object as? Int) == 1 {
+                editor = EditorTarget(item: nil, weekday: date.weekday)
+            }
         }
         .onReceive(ticker) { now = $0 }
     }
@@ -1422,7 +1430,7 @@ struct TodoTab: View {
                             }
                     }
                 }
-                .contentMargins(.bottom, 100, for: .scrollContent)
+                .contentMargins(.bottom, 170, for: .scrollContent)
                 .overlay {
                     if todos.isEmpty {
                         ContentUnavailableView(
@@ -1433,28 +1441,29 @@ struct TodoTab: View {
                     }
                 }
             }
-            .navigationTitle(cal.isDateInToday(date) ? "Сегодня" : Fmt.string(date, "EEEE").capFirst)
-            .navigationSubtitle(Fmt.string(date, "d MMMM"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     SettingsButton()
                 }
-                ToolbarItemGroup(placement: .topBarTrailing) {
+                ToolbarItem(placement: .principal) {
+                    DayTitle(date: date)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
                     Button("Сегодня") {
                         withAnimation(.snappy) { date = Date().startOfDay }
                     }
                     .disabled(cal.isDateInToday(date))
-                    Button {
-                        sheet = TodoSheetTarget(todo: nil)
-                    } label: {
-                        Label("Добавить", systemImage: "plus")
-                    }
                 }
             }
         }
         .sheet(item: $sheet) { target in
             TodoEditor(date: date, editing: target.todo)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .plannerAdd)) { note in
+            if (note.object as? Int) == 2 {
+                sheet = TodoSheetTarget(todo: nil)
+            }
         }
     }
 }
@@ -1515,7 +1524,6 @@ struct TodoEditor: View {
 
                 HStack(spacing: 8) {
                     quick("Сегодня", Date().startOfDay)
-                    quick("Завтра", Date().startOfDay.addingDays(1))
                     Spacer(minLength: 0)
                     DatePicker("Дата", selection: $date, displayedComponents: .date)
                         .labelsHidden()
@@ -1650,19 +1658,23 @@ struct MonthView: View {
                 .foregroundStyle(isCurrentMonth ? brand : Color.primary)
                 .padding(.horizontal, 4)
 
-            // заголовок дней недели в той же сетке — колонки совпадают идеально
             LazyVGrid(columns: columns, spacing: 3) {
                 ForEach(weekdayOrder, id: \.self) { wd in
                     Text(shortWeekday(wd))
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.secondary)
                 }
-                ForEach(0..<offset, id: \.self) { _ in
-                    Color.clear.frame(height: Self.rowHeight)
-                }
-                ForEach(1...count, id: \.self) { d in
-                    let date = cal.date(from: DateComponents(year: year, month: month, day: d)) ?? first
-                    DayCell(date: date, height: Self.rowHeight) { onSelect(date) }
+            }
+
+            // один ForEach с уникальными id: отрицательные — пустые клетки до 1-го числа
+            LazyVGrid(columns: columns, spacing: 3) {
+                ForEach(-offset..<count, id: \.self) { i in
+                    if i < 0 {
+                        Color.clear.frame(height: Self.rowHeight)
+                    } else {
+                        let date = cal.date(from: DateComponents(year: year, month: month, day: i + 1)) ?? first
+                        DayCell(date: date, height: Self.rowHeight) { onSelect(date) }
+                    }
                 }
             }
         }
@@ -1882,7 +1894,7 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    LabeledContent("Версия", value: "1.3")
+                    LabeledContent("Версия", value: "1.4")
                 }
             }
             .navigationTitle("Настройки")
@@ -1913,7 +1925,7 @@ struct SettingsView: View {
                 Text("Разрешите доступ: Настройки → Приложения → Распорядок → Напоминания.")
             }
             .confirmationDialog(
-                "Удалить все задачи и вернуть распорядок по умолчанию?",
+                "Удалить все задачи и весь распорядок?",
                 isPresented: $showReset,
                 titleVisibility: .visible
             ) {
