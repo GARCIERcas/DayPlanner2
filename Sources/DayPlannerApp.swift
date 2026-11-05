@@ -1,6 +1,6 @@
 //
 //  DayPlannerApp.swift
-//  Распорядок дня + To-Do  (v1.5)
+//  Распорядок дня + To-Do  (v1.6)
 //
 //  Требования: Xcode 26+, iOS 26.0+ (Liquid Glass).
 //  Для Напоминаний в Info.plist нужен ключ NSRemindersFullAccessUsageDescription
@@ -996,17 +996,17 @@ struct WeekStrip: View {
     }
 }
 
-/// Заголовок по центру панели: год мелко, месяц крупно. Не меняется при выборе дня.
+/// Заголовок по центру панели: месяц крупно, под ним день недели и число
 struct DayTitle: View {
     let date: Date
 
     var body: some View {
-        VStack(spacing: 0) {
-            Text(Fmt.string(date, "yyyy"))
-                .font(.caption)
-                .foregroundStyle(.secondary)
+        VStack(spacing: 1) {
             Text(Fmt.string(date, "LLLL").capFirst)
                 .font(.title3.weight(.semibold))
+            Text(Fmt.string(date, "EEEE, d").capFirst)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 }
@@ -1092,8 +1092,10 @@ struct ScheduleTab: View {
                     DayTitle(date: date)
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Сегодня") {
+                    Button {
                         withAnimation(.snappy) { date = Date().startOfDay }
+                    } label: {
+                        Label("Вернуться к сегодняшнему дню", systemImage: "arrow.backward")
                     }
                     .disabled(cal.isDateInToday(date))
                 }
@@ -1586,8 +1588,10 @@ struct TodoTab: View {
                     DayTitle(date: date)
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Сегодня") {
+                    Button {
                         withAnimation(.snappy) { date = Date().startOfDay }
+                    } label: {
+                        Label("Вернуться к сегодняшнему дню", systemImage: "arrow.backward")
                     }
                     .disabled(cal.isDateInToday(date))
                 }
@@ -2030,7 +2034,7 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    LabeledContent("Версия", value: "1.5")
+                    LabeledContent("Версия", value: "1.6")
                 }
             }
             .navigationTitle("Настройки")
