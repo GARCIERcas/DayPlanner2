@@ -1,6 +1,6 @@
 //
 //  DayPlannerApp.swift
-//  Распорядок дня + To-Do  (v1.4)
+//  Распорядок дня + To-Do  (v1.5)
 //
 //  Требования: Xcode 26+, iOS 26.0+ (Liquid Glass).
 //  Для Напоминаний в Info.plist нужен ключ NSRemindersFullAccessUsageDescription
@@ -246,8 +246,14 @@ struct ScheduleItem: Identifiable, Codable, Hashable {
     var duration: Int       // минуты (0 = без длительности)
     var weekdays: Set<Int>  // Calendar.weekday
     var reminderID: String?
+    var icon: String?       // своя иконка (SF Symbol) — только для категории «Другое»
 
     var end: Int { start + duration }
+
+    /// Иконка для показа: у «Другое» — выбранная, у остальных категорий — своя
+    var displayIcon: String {
+        kind == .other ? (icon ?? RoutineKind.other.icon) : kind.icon
+    }
 }
 
 struct TodoItem: Identifiable, Codable, Hashable {
@@ -900,7 +906,6 @@ struct WeekStrip: View {
     @Binding var date: Date
     @Environment(\.brand) private var brand
     @State private var weekIndex: Int?
-    @Namespace private var ns
 
     private static let base = Date().weekStart
     private static let range = -156...156   // ±3 года
@@ -953,11 +958,9 @@ struct WeekStrip: View {
 
     private func weekRow(_ i: Int) -> some View {
         let start = Self.start(of: i)
-        return GlassEffectContainer(spacing: 0) {
-            HStack(spacing: 0) {
-                ForEach(0..<7, id: \.self) { k in
-                    dayCell(start.addingDays(k))
-                }
+        return HStack(spacing: 0) {
+            ForEach(0..<7, id: \.self) { k in
+                dayCell(start.addingDays(k))
             }
         }
         .padding(.horizontal, 8)
@@ -980,9 +983,9 @@ struct WeekStrip: View {
                     .frame(width: 40, height: 40)
                     .background {
                         if selected {
-                            Color.clear
-                                .glassEffect(.regular.tint(brand).interactive(), in: .circle)
-                                .glassEffectID("day", in: ns)
+                            Circle()
+                                .fill(brand)
+                                .transition(.scale(scale: 0.6).combined(with: .opacity))
                         }
                     }
             }
@@ -993,16 +996,16 @@ struct WeekStrip: View {
     }
 }
 
-/// Заголовок по центру панели: месяц мелко сверху, день крупно
+/// Заголовок по центру панели: год мелко, месяц крупно. Не меняется при выборе дня.
 struct DayTitle: View {
     let date: Date
 
     var body: some View {
         VStack(spacing: 0) {
-            Text(Fmt.string(date, "LLLL"))
+            Text(Fmt.string(date, "yyyy"))
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Text(cal.isDateInToday(date) ? "Сегодня" : Fmt.string(date, "EEEE, d").capFirst)
+            Text(Fmt.string(date, "LLLL").capFirst)
                 .font(.title3.weight(.semibold))
         }
     }
@@ -1026,7 +1029,7 @@ struct ScheduleTab: View {
 
     var body: some View {
         let items = store.items(forWeekday: date.weekday)
-        let nowID = currentID(in: items)
+        let nowIDs = currentIDs(in: items)
 
         NavigationStack {
             VStack(spacing: 0) {
@@ -1041,7 +1044,7 @@ struct ScheduleTab: View {
                                     Button {
                                         editor = EditorTarget(item: item, weekday: date.weekday)
                                     } label: {
-                                        ScheduleRow(item: item, isNow: item.id == nowID)
+                                        ScheduleRow(item: item, isNow: nowIDs.contains(item.id))
                                     }
                                     .buttonStyle(.plain)
                                     .contextMenu {
@@ -1107,11 +1110,16 @@ struct ScheduleTab: View {
         .onReceive(ticker) { now = $0 }
     }
 
-    /// Какой пункт идёт «сейчас» (только для сегодняшнего дня)
-    private func currentID(in items: [ScheduleItem]) -> UUID? {
-        guard cal.isDateInToday(date) else { return nil }
+    /// Пункты, которые идут прямо сейчас (только для сегодняшнего дня).
+    /// Пункт без длительности считается «текущим» первые 5 минут.
+    private func currentIDs(in items: [ScheduleItem]) -> Set<UUID> {
+        guard cal.isDateInToday(date) else { return [] }
         let m = now.minutesOfDay
-        return items.last(where: { $0.start <= m })?.id
+        let active = items.filter { item in
+            let end = item.start + (item.duration > 0 ? item.duration : 5)
+            return item.start <= m && m < end
+        }
+        return Set(active.map { $0.id })
     }
 }
 
@@ -1155,7 +1163,7 @@ struct ScheduleRow: View {
             }
             .frame(minWidth: 50, alignment: .trailing)
 
-            Image(systemName: item.kind.icon)
+            Image(systemName: item.displayIcon)
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(.white)
                 .frame(width: 36, height: 36)
@@ -1187,10 +1195,13 @@ struct ScheduleRow: View {
     }
 
     private var subtitle: String? {
+        let sameAsKind = item.title == item.kind.title
         if item.duration > 0 {
-            return "\(item.kind.title) · \(durationText(item.duration))"
+            return sameAsKind
+                ? durationText(item.duration)
+                : "\(item.kind.title) · \(durationText(item.duration))"
         }
-        return item.title == item.kind.title ? nil : item.kind.title
+        return sameAsKind ? nil : item.kind.title
     }
 }
 
@@ -1208,6 +1219,7 @@ struct ScheduleEditor: View {
     @State private var time: Date
     @State private var duration: Int
     @State private var weekdays: Set<Int>
+    @State private var icon: String
 
     private static let durations = [0, 15, 30, 45, 60, 90, 120, 180, 240, 360, 480]
 
@@ -1216,8 +1228,9 @@ struct ScheduleEditor: View {
         _title = State(initialValue: item?.title ?? "")
         _kind = State(initialValue: item?.kind ?? .other)
         _time = State(initialValue: Self.date(fromMinutes: item?.start ?? 9 * 60))
-        _duration = State(initialValue: item?.duration ?? 30)
+        _duration = State(initialValue: item?.duration ?? 0)
         _weekdays = State(initialValue: item?.weekdays ?? [weekday])
+        _icon = State(initialValue: item?.icon ?? RoutineKind.other.icon)
     }
 
     var body: some View {
@@ -1225,7 +1238,7 @@ struct ScheduleEditor: View {
             Form {
                 Section {
                     HStack(spacing: 12) {
-                        Image(systemName: kind.icon)
+                        Image(systemName: kind == .other ? icon : kind.icon)
                             .font(.system(size: 16, weight: .semibold))
                             .foregroundStyle(.white)
                             .frame(width: 36, height: 36)
@@ -1255,6 +1268,23 @@ struct ScheduleEditor: View {
                         .padding(.vertical, 8)
                     }
                     .listRowInsets(EdgeInsets())
+                }
+
+                if kind == .other {
+                    Section("Иконка") {
+                        NavigationLink {
+                            IconPicker(selection: $icon)
+                        } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: icon)
+                                    .font(.system(size: 15, weight: .semibold))
+                                    .foregroundStyle(.white)
+                                    .frame(width: 32, height: 32)
+                                    .background(kind.color.gradient, in: .circle)
+                                Text("Выбрать иконку")
+                            }
+                        }
+                    }
                 }
 
                 Section("Время") {
@@ -1339,7 +1369,6 @@ struct ScheduleEditor: View {
 
     private func pick(_ k: RoutineKind) {
         if title.isEmpty || title == kind.title { title = k.title }
-        if original == nil, k == .wake || k == .sleep { duration = 0 }
         kind = k
     }
 
@@ -1352,6 +1381,7 @@ struct ScheduleEditor: View {
         item.start = time.minutesOfDay
         item.duration = duration
         item.weekdays = weekdays
+        item.icon = kind == .other ? icon : nil
 
         store.upsert(item)
         dismiss()
@@ -1359,6 +1389,112 @@ struct ScheduleEditor: View {
 
     private static func date(fromMinutes m: Int) -> Date {
         cal.date(bySettingHour: m / 60, minute: m % 60, second: 0, of: Date()) ?? Date()
+    }
+}
+
+// MARK: - Выбор иконки (SF Symbols)
+
+struct IconGroup: Identifiable {
+    let id: String
+    let icons: [String]
+}
+
+struct IconPicker: View {
+    @Binding var selection: String
+    @Environment(\.brand) private var brand
+    @State private var custom = ""
+
+    private static func exists(_ name: String) -> Bool {
+        !name.isEmpty && UIImage(systemName: name) != nil
+    }
+
+    private static let groups: [IconGroup] = [
+        IconGroup(id: "Дом и быт", icons: [
+            "house.fill", "bed.double.fill", "shower.fill", "washer.fill", "trash.fill", "cart.fill",
+            "bag.fill", "lightbulb.fill", "key.fill", "hammer.fill", "wrench.and.screwdriver.fill", "paintbrush.fill"
+        ]),
+        IconGroup(id: "Еда и напитки", icons: [
+            "cup.and.saucer.fill", "fork.knife", "wineglass.fill", "birthday.cake.fill", "carrot.fill",
+            "takeoutbag.and.cup.and.straw.fill", "waterbottle.fill", "mug.fill"
+        ]),
+        IconGroup(id: "Спорт и здоровье", icons: [
+            "figure.run", "figure.walk", "dumbbell.fill", "bicycle", "figure.yoga", "figure.pool.swim",
+            "heart.fill", "cross.case.fill", "pills.fill", "stethoscope", "bandage.fill", "brain.head.profile",
+            "drop.fill", "flame.fill", "soccerball", "figure.mind.and.body"
+        ]),
+        IconGroup(id: "Работа и учёба", icons: [
+            "briefcase.fill", "laptopcomputer", "desktopcomputer", "book.fill", "graduationcap.fill", "pencil",
+            "doc.text.fill", "folder.fill", "envelope.fill", "phone.fill", "calendar", "chart.bar.fill",
+            "person.2.fill", "bubble.left.fill"
+        ]),
+        IconGroup(id: "Транспорт и поездки", icons: [
+            "car.fill", "bus.fill", "tram.fill", "airplane", "fuelpump.fill", "map.fill", "location.fill",
+            "suitcase.fill", "tent.fill", "beach.umbrella.fill"
+        ]),
+        IconGroup(id: "Отдых и хобби", icons: [
+            "gamecontroller.fill", "tv.fill", "headphones", "music.note", "film.fill", "camera.fill",
+            "guitars.fill", "theatermasks.fill", "party.popper.fill", "book.closed.fill", "puzzlepiece.fill",
+            "paintpalette.fill", "pawprint.fill", "leaf.fill"
+        ]),
+        IconGroup(id: "Разное", icons: [
+            "star.fill", "sun.max.fill", "moon.fill", "cloud.fill", "snowflake", "bolt.fill", "gift.fill",
+            "bell.fill", "flag.fill", "creditcard.fill", "banknote.fill", "scissors", "hands.clap.fill",
+            "face.smiling.fill", "sparkles", "bookmark.fill"
+        ])
+    ]
+
+    var body: some View {
+        List {
+            Section {
+                HStack(spacing: 12) {
+                    TextField("например, sparkles", text: $custom)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .submitLabel(.done)
+                    if Self.exists(trimmedCustom) {
+                        Image(systemName: trimmedCustom)
+                            .font(.title3)
+                            .foregroundStyle(brand)
+                    }
+                }
+            } header: {
+                Text("Своё название SF Symbol")
+            } footer: {
+                Text("Введите название любого символа из набора SF Symbols — он применится сразу.")
+            }
+
+            ForEach(Self.groups) { group in
+                Section(group.id) {
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 6), spacing: 12) {
+                        ForEach(group.icons.filter { Self.exists($0) }, id: \.self) { name in
+                            Button {
+                                selection = name
+                            } label: {
+                                Image(systemName: name)
+                                    .font(.title3)
+                                    .frame(width: 44, height: 44)
+                                    .foregroundStyle(selection == name ? Color.white : Color.primary)
+                                    .background(
+                                        selection == name ? brand : Color.secondary.opacity(0.12),
+                                        in: .circle
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.vertical, 6)
+                }
+            }
+        }
+        .navigationTitle("Иконка")
+        .navigationBarTitleDisplayMode(.inline)
+        .onChange(of: custom) { _, _ in
+            if Self.exists(trimmedCustom) { selection = trimmedCustom }
+        }
+    }
+
+    private var trimmedCustom: String {
+        custom.trimmingCharacters(in: .whitespaces)
     }
 }
 
@@ -1894,7 +2030,7 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    LabeledContent("Версия", value: "1.4")
+                    LabeledContent("Версия", value: "1.5")
                 }
             }
             .navigationTitle("Настройки")
