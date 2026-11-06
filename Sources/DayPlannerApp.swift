@@ -1,6 +1,6 @@
 //
 //  DayPlannerApp.swift
-//  Распорядок дня + To-Do  (v1.6)
+//  Распорядок дня + To-Do  (v1.8)
 //
 //  Требования: Xcode 26+, iOS 26.0+ (Liquid Glass).
 //  Для Напоминаний в Info.plist нужен ключ NSRemindersFullAccessUsageDescription
@@ -36,6 +36,9 @@ struct DayPlannerApp: App {
 
 enum Palette {
     static let colors: [Color] = [.blue, .indigo, .purple, .pink, .orange, .green, .teal]
+
+    /// Цвета иконки для категории «Другое» (0 — серый по умолчанию)
+    static let iconColors: [Color] = [.gray, .red, .orange, .yellow, .green, .blue, .purple, .pink]
 
     static func color(_ i: Int) -> Color {
         colors.indices.contains(i) ? colors[i] : Color.blue
@@ -79,6 +82,12 @@ private let cal = Calendar.planner
 extension Notification.Name {
     /// Нажата плавающая кнопка «+» (object — номер вкладки)
     static let plannerAdd = Notification.Name("plannerAdd")
+}
+
+/// Ключ дня (гггг мм дд числом) — для списка пропущенных повторов
+private func dayKey(_ d: Date) -> Int {
+    let c = cal.dateComponents([.year, .month, .day], from: d)
+    return (c.year ?? 0) * 10_000 + (c.month ?? 0) * 100 + (c.day ?? 0)
 }
 
 /// Порядок дней недели (Calendar.weekday: 1 = Вс, 2 = Пн ... 7 = Сб)
@@ -210,6 +219,15 @@ enum DayPart: CaseIterable, Identifiable {
         }
     }
 
+    var span: Range<Int> {
+        switch self {
+        case .morning: 240..<720
+        case .day: 720..<1080
+        case .evening: 1080..<1440
+        case .night: 0..<240
+        }
+    }
+
     var range: String {
         switch self {
         case .morning: "04:00 – 12:00"
@@ -247,12 +265,21 @@ struct ScheduleItem: Identifiable, Codable, Hashable {
     var weekdays: Set<Int>  // Calendar.weekday
     var reminderID: String?
     var icon: String?       // своя иконка (SF Symbol) — только для категории «Другое»
+    var iconColor: Int?     // индекс в Palette.iconColors — только для категории «Другое»
 
     var end: Int { start + duration }
 
     /// Иконка для показа: у «Другое» — выбранная, у остальных категорий — своя
     var displayIcon: String {
         kind == .other ? (icon ?? RoutineKind.other.icon) : kind.icon
+    }
+
+    /// Цвет кружка: у «Другое» — выбранный, у остальных категорий — свой
+    var displayColor: Color {
+        guard kind == .other, let i = iconColor, Palette.iconColors.indices.contains(i) else {
+            return kind.color
+        }
+        return Palette.iconColors[i]
     }
 }
 
@@ -262,6 +289,18 @@ struct TodoItem: Identifiable, Codable, Hashable {
     var date: Date
     var isDone = false
     var reminderID: String?
+    var seriesID: UUID?     // повторяющаяся задача: к какой серии относится
+}
+
+/// Повторяющаяся задача: по выбранным дням недели, по желанию — до даты.
+/// Каждое повторение — отдельная задача со своей отметкой «выполнено».
+struct TodoSeries: Identifiable, Codable, Hashable {
+    var id = UUID()
+    var title: String
+    var weekdays: Set<Int>   // Calendar.weekday
+    var start: Date
+    var end: Date?
+    var skipped: Set<Int> = []   // удалённые/перенесённые дни (ключи dayKey)
 }
 
 struct ReminderListInfo: Identifiable {
@@ -421,12 +460,17 @@ final class RemindersService {
 final class Store: ObservableObject {
     @Published private(set) var schedule: [ScheduleItem] = []
     @Published private(set) var todos: [TodoItem] = []
+    @Published private(set) var series: [TodoSeries] = []
+
+    /// На сколько дней вперёд создаются повторы (дальше — по мере наступления)
+    private let horizonDays = 28
 
     let reminders = RemindersService()
 
     private struct Snapshot: Codable {
         var schedule: [ScheduleItem]
         var todos: [TodoItem]
+        var series: [TodoSeries]?
     }
 
     private let url = URL.documentsDirectory.appending(path: "planner.json")
@@ -436,9 +480,11 @@ final class Store: ObservableObject {
            let snap = try? JSONDecoder().decode(Snapshot.self, from: data) {
             schedule = snap.schedule
             todos = snap.todos
+            series = snap.series ?? []
         } else {
             save()
         }
+        if !series.isEmpty { extendSeries() }
     }
 
     // Распорядок
@@ -493,6 +539,7 @@ final class Store: ObservableObject {
 
     func updateTodo(_ todo: TodoItem, title: String, date: Date) {
         guard let i = todos.firstIndex(where: { $0.id == todo.id }) else { return }
+        if !cal.isDate(todos[i].date, inSameDayAs: date) { skip(todos[i]) }
         todos[i].title = title
         todos[i].date = date.startOfDay
         reminders.update(id: todos[i].reminderID, title: title, date: todos[i].date)
@@ -507,13 +554,34 @@ final class Store: ObservableObject {
     }
 
     func delete(_ todo: TodoItem) {
+        skip(todo)
         reminders.remove(id: todo.reminderID)
         todos.removeAll { $0.id == todo.id }
         save()
     }
 
+    /// Сколько дел стоит на выбранных датах
+    func todoCount(on dates: [Date]) -> Int {
+        let keys = Set(dates.map { dayKey($0) })
+        return todos.filter { keys.contains(dayKey($0.date)) }.count
+    }
+
+    /// Удаляет все дела на выбранных датах (повторы на эти даты не вернутся)
+    func clearTodos(on dates: [Date]) {
+        let keys = Set(dates.map { dayKey($0) })
+        for t in todos where keys.contains(dayKey(t.date)) {
+            skip(t)
+            reminders.remove(id: t.reminderID)
+        }
+        todos.removeAll { keys.contains(dayKey($0.date)) }
+        save()
+    }
+
     func clearCompleted() {
-        for t in todos where t.isDone { reminders.remove(id: t.reminderID) }
+        for t in todos where t.isDone {
+            skip(t)
+            reminders.remove(id: t.reminderID)
+        }
         todos.removeAll { $0.isDone }
         save()
     }
@@ -522,8 +590,67 @@ final class Store: ObservableObject {
         for t in todos { reminders.remove(id: t.reminderID) }
         for s in schedule { reminders.removeRoutine(s) }
         todos = []
+        series = []
         schedule = []
         save()
+    }
+
+    // Повторяющиеся задачи
+
+    func addRepeating(_ title: String, from date: Date, weekdays: Set<Int>, until: Date?) {
+        let s = TodoSeries(title: title, weekdays: weekdays, start: date.startOfDay, end: until?.startOfDay)
+        series.append(s)
+        generate(for: s, from: s.start)
+        save()
+    }
+
+    /// Дозаполняет повторы на горизонт вперёд (вызывается при запуске и при возврате в приложение)
+    func extendSeries() {
+        let today = Date().startOfDay
+        series.removeAll { s in
+            if let end = s.end { return end < today }
+            return false
+        }
+        for s in series { generate(for: s, from: max(s.start, today)) }
+        save()
+    }
+
+    /// Удаляет эту серию: будущие невыполненные повторы пропадают, прошлые остаются
+    func deleteSeries(of todo: TodoItem) {
+        guard let sid = todo.seriesID else { return }
+        let today = Date().startOfDay
+        for t in todos where t.seriesID == sid && t.date >= today && !t.isDone {
+            reminders.remove(id: t.reminderID)
+        }
+        todos.removeAll { $0.seriesID == sid && $0.date >= today && !$0.isDone }
+        for i in todos.indices where todos[i].seriesID == sid { todos[i].seriesID = nil }
+        series.removeAll { $0.id == sid }
+        save()
+    }
+
+    private func generate(for s: TodoSeries, from first: Date) {
+        let today = Date().startOfDay
+        var limit = today.addingDays(horizonDays)
+        if let end = s.end, end < limit { limit = end }
+        var day = max(first.startOfDay, today.addingDays(-366))
+        var created: [TodoItem] = []
+        while day <= limit {
+            if s.weekdays.contains(day.weekday),
+               !s.skipped.contains(dayKey(day)),
+               !todos.contains(where: { $0.seriesID == s.id && cal.isDate($0.date, inSameDayAs: day) }) {
+                let rid = reminders.create(title: s.title, date: day)
+                created.append(TodoItem(title: s.title, date: day, reminderID: rid, seriesID: s.id))
+            }
+            day = day.addingDays(1)
+        }
+        if !created.isEmpty { todos.append(contentsOf: created) }
+    }
+
+    /// Запоминает, что этот день серии удалён/перенесён — чтобы он не появился снова
+    private func skip(_ todo: TodoItem) {
+        guard let sid = todo.seriesID,
+              let i = series.firstIndex(where: { $0.id == sid }) else { return }
+        series[i].skipped.insert(dayKey(todo.date))
     }
 
     // Синхронизация с Напоминаниями
@@ -590,6 +717,7 @@ final class Store: ObservableObject {
                 }
                 i += 1
             } else {
+                skip(list[i])
                 list.remove(at: i)   // удалено в Напоминаниях
                 changed = true
             }
@@ -604,7 +732,7 @@ final class Store: ObservableObject {
     // Сохранение
 
     private func save() {
-        let snap = Snapshot(schedule: schedule, todos: todos)
+        let snap = Snapshot(schedule: schedule, todos: todos, series: series)
         do {
             try JSONEncoder().encode(snap).write(to: url, options: .atomic)
         } catch {
@@ -798,9 +926,15 @@ struct RootView: View {
             .animation(.snappy, value: tab)
         }
         .sensoryFeedback(.selection, trigger: tab)
-        .task { await store.pullReminders() }
+        .task {
+            store.extendSeries()
+            await store.pullReminders()
+        }
         .onChange(of: phase) { _, new in
-            if new == .active { Task { await store.pullReminders() } }
+            if new == .active {
+                store.extendSeries()
+                Task { await store.pullReminders() }
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .EKEventStoreChanged)) { _ in
             Task { await store.pullReminders() }
@@ -1019,6 +1153,16 @@ struct EditorTarget: Identifiable {
     var weekday: Int
 }
 
+/// Отрезок пункта внутри одного дня (spill — продолжение пункта, начатого накануне)
+struct DaySegment: Identifiable {
+    let item: ScheduleItem
+    let start: Int
+    let end: Int
+    let spill: Bool
+
+    var id: String { item.id.uuidString + (spill ? "-s" : "") }
+}
+
 struct ScheduleTab: View {
     @EnvironmentObject private var store: Store
     @State private var date = Date().startOfDay
@@ -1028,8 +1172,8 @@ struct ScheduleTab: View {
     private let ticker = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        let items = store.items(forWeekday: date.weekday)
-        let nowIDs = currentIDs(in: items)
+        let segs = segments(for: date)
+        let nowIDs = currentIDs(in: segs)
 
         NavigationStack {
             VStack(spacing: 0) {
@@ -1037,33 +1181,32 @@ struct ScheduleTab: View {
 
                 List {
                     ForEach(DayPart.allCases) { part in
-                        let rows = items.filter { DayPart.of($0.start) == part }
-                        if !rows.isEmpty {
+                        let lower = part.span.lowerBound
+                        // пункты, начавшиеся раньше и ещё идущие в этой части суток
+                        let continuing = segs.filter { seg in
+                            seg.spill ? seg.end > lower : (seg.start < lower && seg.end > lower)
+                        }
+                        let starting = segs.filter { !$0.spill && DayPart.of($0.start) == part }
+
+                        if !continuing.isEmpty || !starting.isEmpty {
                             Section {
-                                ForEach(rows) { item in
+                                ForEach(continuing) { seg in
                                     Button {
-                                        editor = EditorTarget(item: item, weekday: date.weekday)
+                                        openEditor(seg)
                                     } label: {
-                                        ScheduleRow(item: item, isNow: nowIDs.contains(item.id))
+                                        ContinuationRow(segment: seg, isNow: nowIDs.contains(seg.item.id))
                                     }
                                     .buttonStyle(.plain)
-                                    .contextMenu {
-                                        Button {
-                                            editor = EditorTarget(item: item, weekday: date.weekday)
-                                        } label: {
-                                            Label("Изменить", systemImage: "pencil")
-                                        }
-                                        Button(role: .destructive) {
-                                            withAnimation { store.remove(item, fromWeekday: date.weekday) }
-                                        } label: {
-                                            Label("Убрать из этого дня", systemImage: "calendar.badge.minus")
-                                        }
-                                        Button(role: .destructive) {
-                                            withAnimation { store.removeEverywhere(item) }
-                                        } label: {
-                                            Label("Удалить из всех дней", systemImage: "trash")
-                                        }
+                                    .contextMenu { menuItems(for: seg) }
+                                }
+                                ForEach(starting) { seg in
+                                    Button {
+                                        openEditor(seg)
+                                    } label: {
+                                        ScheduleRow(item: seg.item, isNow: nowIDs.contains(seg.item.id))
                                     }
+                                    .buttonStyle(.plain)
+                                    .contextMenu { menuItems(for: seg) }
                                 }
                             } header: {
                                 PartHeader(part: part)
@@ -1074,7 +1217,7 @@ struct ScheduleTab: View {
                 .listStyle(.plain)
                 .contentMargins(.bottom, 170, for: .scrollContent)
                 .overlay {
-                    if items.isEmpty {
+                    if segs.isEmpty {
                         ContentUnavailableView(
                             "Распорядок пуст",
                             systemImage: "clock",
@@ -1112,16 +1255,101 @@ struct ScheduleTab: View {
         .onReceive(ticker) { now = $0 }
     }
 
+    /// Отрезки пунктов этого дня + продолжение вчерашних пунктов, перешедших за полночь
+    private func segments(for day: Date) -> [DaySegment] {
+        let own = store.items(forWeekday: day.weekday).map {
+            DaySegment(item: $0, start: $0.start, end: min($0.end, 1440), spill: false)
+        }
+        let spilled = store.items(forWeekday: day.addingDays(-1).weekday)
+            .filter { $0.end > 1440 }
+            .map { DaySegment(item: $0, start: 0, end: $0.end - 1440, spill: true) }
+        return (own + spilled).sorted { $0.start < $1.start }
+    }
+
+    private func weekday(of seg: DaySegment) -> Int {
+        seg.spill ? date.addingDays(-1).weekday : date.weekday
+    }
+
+    private func openEditor(_ seg: DaySegment) {
+        editor = EditorTarget(item: seg.item, weekday: weekday(of: seg))
+    }
+
+    @ViewBuilder
+    private func menuItems(for seg: DaySegment) -> some View {
+        Button {
+            openEditor(seg)
+        } label: {
+            Label("Изменить", systemImage: "pencil")
+        }
+        Button(role: .destructive) {
+            withAnimation { store.remove(seg.item, fromWeekday: weekday(of: seg)) }
+        } label: {
+            Label("Убрать из этого дня", systemImage: "calendar.badge.minus")
+        }
+        Button(role: .destructive) {
+            withAnimation { store.removeEverywhere(seg.item) }
+        } label: {
+            Label("Удалить из всех дней", systemImage: "trash")
+        }
+    }
+
     /// Пункты, которые идут прямо сейчас (только для сегодняшнего дня).
     /// Пункт без длительности считается «текущим» первые 5 минут.
-    private func currentIDs(in items: [ScheduleItem]) -> Set<UUID> {
+    private func currentIDs(in segs: [DaySegment]) -> Set<UUID> {
         guard cal.isDateInToday(date) else { return [] }
         let m = now.minutesOfDay
-        let active = items.filter { item in
-            let end = item.start + (item.duration > 0 ? item.duration : 5)
-            return item.start <= m && m < end
+        let active = segs.filter { seg in
+            if seg.spill { return m < seg.end }
+            let end = seg.item.duration > 0 ? seg.end : seg.start + 5
+            return seg.start <= m && m < end
         }
-        return Set(active.map { $0.id })
+        return Set(active.map { $0.item.id })
+    }
+}
+
+/// Строка-продолжение: пункт начался раньше и ещё идёт в этой части суток
+struct ContinuationRow: View {
+    @Environment(\.brand) private var brand
+    let segment: DaySegment
+    var isNow = false
+
+    var body: some View {
+        let item = segment.item
+
+        HStack(spacing: 14) {
+            Image(systemName: "arrow.turn.down.right")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 50, alignment: .trailing)
+
+            Image(systemName: item.displayIcon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 30, height: 30)
+                .background(item.displayColor.gradient, in: .circle)
+                .padding(.horizontal, 3)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.title)
+                    .font(.callout.weight(.medium))
+                Text("продолжается до \(Fmt.time(item.end))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 0)
+
+            if isNow {
+                Text("Сейчас")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(brand)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(brand.opacity(0.16), in: .capsule)
+            }
+        }
+        .padding(.vertical, 2)
+        .contentShape(Rectangle())
     }
 }
 
@@ -1169,7 +1397,7 @@ struct ScheduleRow: View {
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(.white)
                 .frame(width: 36, height: 36)
-                .background(item.kind.color.gradient, in: .circle)
+                .background(item.displayColor.gradient, in: .circle)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.title)
@@ -1222,8 +1450,7 @@ struct ScheduleEditor: View {
     @State private var duration: Int
     @State private var weekdays: Set<Int>
     @State private var icon: String
-
-    private static let durations = [0, 15, 30, 45, 60, 90, 120, 180, 240, 360, 480]
+    @State private var iconColor: Int
 
     init(item: ScheduleItem?, weekday: Int) {
         original = item
@@ -1233,6 +1460,7 @@ struct ScheduleEditor: View {
         _duration = State(initialValue: item?.duration ?? 0)
         _weekdays = State(initialValue: item?.weekdays ?? [weekday])
         _icon = State(initialValue: item?.icon ?? RoutineKind.other.icon)
+        _iconColor = State(initialValue: item?.iconColor ?? 0)
     }
 
     var body: some View {
@@ -1244,7 +1472,7 @@ struct ScheduleEditor: View {
                             .font(.system(size: 16, weight: .semibold))
                             .foregroundStyle(.white)
                             .frame(width: 36, height: 36)
-                            .background(kind.color.gradient, in: .circle)
+                            .background(previewColor.gradient, in: .circle)
                         TextField("Название", text: $title)
                             .focused($focused)
                             .submitLabel(.done)
@@ -1282,22 +1510,42 @@ struct ScheduleEditor: View {
                                     .font(.system(size: 15, weight: .semibold))
                                     .foregroundStyle(.white)
                                     .frame(width: 32, height: 32)
-                                    .background(kind.color.gradient, in: .circle)
+                                    .background(previewColor.gradient, in: .circle)
                                 Text("Выбрать иконку")
                             }
                         }
+
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 10) {
+                                ForEach(Palette.iconColors.indices, id: \.self) { i in
+                                    Button { iconColor = i } label: {
+                                        Circle()
+                                            .fill(Palette.iconColors[i].gradient)
+                                            .frame(width: 30, height: 30)
+                                            .overlay {
+                                                if iconColor == i {
+                                                    Image(systemName: "checkmark")
+                                                        .font(.caption.bold())
+                                                        .foregroundStyle(.white)
+                                                }
+                                            }
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 8)
+                        }
+                        .listRowInsets(EdgeInsets())
                     }
                 }
 
                 Section("Время") {
                     DatePicker("Начало", selection: $time, displayedComponents: .hourAndMinute)
-                    Picker("Длительность", selection: $duration) {
-                        ForEach(Self.durations, id: \.self) { d in
-                            Text(d == 0 ? "Без длительности" : durationText(d)).tag(d)
-                        }
-                    }
+                    Toggle("Окончание", isOn: hasEnd)
                     if duration > 0 {
-                        LabeledContent("Окончание", value: Fmt.time(time.minutesOfDay + duration))
+                        DatePicker("Конец", selection: endTime, displayedComponents: .hourAndMinute)
+                        LabeledContent("Длительность", value: durationText(duration))
                     }
                 }
 
@@ -1369,6 +1617,31 @@ struct ScheduleEditor: View {
         !title.trimmingCharacters(in: .whitespaces).isEmpty && !weekdays.isEmpty
     }
 
+    private var previewColor: Color {
+        guard kind == .other, Palette.iconColors.indices.contains(iconColor) else { return kind.color }
+        return Palette.iconColors[iconColor]
+    }
+
+    /// Переключатель «Окончание»: включён, если есть длительность
+    private var hasEnd: Binding<Bool> {
+        Binding(
+            get: { duration > 0 },
+            set: { duration = $0 ? 60 : 0 }
+        )
+    }
+
+    /// Своё время окончания; если оно раньше начала — значит, на следующие сутки.
+    /// При смене начала длительность сохраняется, конец сдвигается вместе с ним.
+    private var endTime: Binding<Date> {
+        Binding(
+            get: { Self.date(fromMinutes: (time.minutesOfDay + duration) % 1440) },
+            set: { newEnd in
+                let diff = (newEnd.minutesOfDay - time.minutesOfDay + 1440) % 1440
+                if diff > 0 { duration = diff }
+            }
+        )
+    }
+
     private func pick(_ k: RoutineKind) {
         if title.isEmpty || title == kind.title { title = k.title }
         kind = k
@@ -1384,6 +1657,7 @@ struct ScheduleEditor: View {
         item.duration = duration
         item.weekdays = weekdays
         item.icon = kind == .other ? icon : nil
+        item.iconColor = kind == .other ? iconColor : nil
 
         store.upsert(item)
         dismiss()
@@ -1560,6 +1834,13 @@ struct TodoTab: View {
                                 } label: {
                                     Label("Перенести на следующий день", systemImage: "calendar.badge.plus")
                                 }
+                                if todo.seriesID != nil {
+                                    Button(role: .destructive) {
+                                        withAnimation { store.deleteSeries(of: todo) }
+                                    } label: {
+                                        Label("Удалить все повторы", systemImage: "trash.circle")
+                                    }
+                                }
                                 Button(role: .destructive) {
                                     withAnimation { store.delete(todo) }
                                 } label: {
@@ -1624,6 +1905,11 @@ struct TodoRow: View {
                 Text(todo.title)
                     .strikethrough(todo.isDone)
                     .foregroundStyle(todo.isDone ? .secondary : .primary)
+                if todo.seriesID != nil {
+                    Image(systemName: "repeat")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer(minLength: 0)
             }
             .contentShape(Rectangle())
@@ -1643,44 +1929,64 @@ struct TodoEditor: View {
     private let editing: TodoItem?
     @State private var text: String
     @State private var date: Date
+    @State private var repeatOn = false
+    @State private var weekdays: Set<Int>
+    @State private var limitOn = false
+    @State private var until: Date
+    @State private var detent: PresentationDetent = .height(340)
 
     init(date: Date, editing: TodoItem? = nil) {
         self.editing = editing
+        let day = (editing?.date ?? date).startOfDay
         _text = State(initialValue: editing?.title ?? "")
-        _date = State(initialValue: (editing?.date ?? date).startOfDay)
+        _date = State(initialValue: day)
+        _weekdays = State(initialValue: [day.weekday])
+        _until = State(initialValue: day.addingDays(28))
     }
 
     private var trimmed: String { text.trimmingCharacters(in: .whitespaces) }
+    private var canCommit: Bool { !trimmed.isEmpty && !(repeatOn && weekdays.isEmpty) }
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 16) {
-                TextField("Что нужно сделать?", text: $text)
-                    .focused($focused)
-                    .submitLabel(.done)
-                    .onSubmit(commit)
-                    .padding(14)
-                    .glassEffect(.regular, in: .rect(cornerRadius: 16))
+            ScrollView {
+                VStack(spacing: 16) {
+                    TextField("Что нужно сделать?", text: $text)
+                        .focused($focused)
+                        .submitLabel(.done)
+                        .onSubmit(commit)
+                        .padding(14)
+                        .glassEffect(.regular, in: .rect(cornerRadius: 16))
 
-                HStack(spacing: 8) {
-                    quick("Сегодня", Date().startOfDay)
-                    Spacer(minLength: 0)
-                    DatePicker("Дата", selection: $date, displayedComponents: .date)
-                        .labelsHidden()
+                    HStack(spacing: 8) {
+                        quick("Сегодня", Date().startOfDay)
+                        Spacer(minLength: 0)
+                        DatePicker("Дата", selection: $date, displayedComponents: .date)
+                            .labelsHidden()
+                    }
+
+                    if editing == nil {
+                        repeatCard
+                    } else if editing?.seriesID != nil {
+                        Label("Повторяющаяся задача — изменения касаются только этого дня",
+                              systemImage: "repeat")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+
+                    Button(action: commit) {
+                        Label(editing == nil ? "Добавить" : "Сохранить",
+                              systemImage: editing == nil ? "plus" : "checkmark")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.glassProminent)
+                    .controlSize(.large)
+                    .disabled(!canCommit)
                 }
-
-                Button(action: commit) {
-                    Label(editing == nil ? "Добавить" : "Сохранить",
-                          systemImage: editing == nil ? "plus" : "checkmark")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.glassProminent)
-                .controlSize(.large)
-                .disabled(trimmed.isEmpty)
-
-                Spacer(minLength: 0)
+                .padding()
             }
-            .padding()
+            .scrollDismissesKeyboard(.interactively)
             .navigationTitle(editing == nil ? "Новая задача" : "Изменить задачу")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -1689,9 +1995,65 @@ struct TodoEditor: View {
                 }
             }
         }
-        .presentationDetents([.height(330), .large])
+        .presentationDetents([.height(340), .large], selection: $detent)
         .presentationDragIndicator(.visible)
+        .onChange(of: repeatOn) { _, on in
+            if on { weekdays = [date.weekday] }
+            detent = on ? .large : .height(340)
+        }
         .onAppear { focused = true }
+    }
+
+    private var repeatCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Toggle(isOn: $repeatOn.animation(.snappy)) {
+                Label("Повторять по дням", systemImage: "repeat")
+            }
+
+            if repeatOn {
+                HStack(spacing: 6) {
+                    ForEach(weekdayOrder, id: \.self) { wd in
+                        let on = weekdays.contains(wd)
+                        Button {
+                            if on { weekdays.remove(wd) } else { weekdays.insert(wd) }
+                        } label: {
+                            Text(shortWeekday(wd))
+                                .font(.subheadline.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 10)
+                                .foregroundStyle(on ? Color.white : Color.primary)
+                                .background(
+                                    on ? brand : Color.secondary.opacity(0.15),
+                                    in: .rect(cornerRadius: 10)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                HStack(spacing: 8) {
+                    Button("Каждый день") { weekdays = Set(1...7) }
+                    Button("Будни") { weekdays = [2, 3, 4, 5, 6] }
+                    Button("Выходные") { weekdays = [1, 7] }
+                    Spacer(minLength: 0)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Toggle("Закончить повторы", isOn: $limitOn.animation(.snappy))
+                if limitOn {
+                    DatePicker("До", selection: $until, in: date..., displayedComponents: .date)
+                }
+
+                if weekdays.isEmpty {
+                    Text("Выберите хотя бы один день")
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                }
+            }
+        }
+        .padding(14)
+        .glassEffect(.regular, in: .rect(cornerRadius: 16))
     }
 
     private func quick(_ title: String, _ day: Date) -> some View {
@@ -1703,9 +2065,11 @@ struct TodoEditor: View {
     }
 
     private func commit() {
-        guard !trimmed.isEmpty else { return }
+        guard canCommit else { return }
         if let editing {
             store.updateTodo(editing, title: trimmed, date: date)
+        } else if repeatOn {
+            store.addRepeating(trimmed, from: date, weekdays: weekdays, until: limitOn ? until : nil)
         } else {
             store.addTodo(trimmed, on: date)
         }
@@ -2029,12 +2393,17 @@ struct SettingsView: View {
                 }
 
                 Section("Данные") {
+                    NavigationLink {
+                        ClearDatesView()
+                    } label: {
+                        Label("Очистить дела по датам", systemImage: "calendar.badge.minus")
+                    }
                     Button("Удалить выполненные задачи") { store.clearCompleted() }
                     Button("Сбросить всё", role: .destructive) { showReset = true }
                 }
 
                 Section {
-                    LabeledContent("Версия", value: "1.6")
+                    LabeledContent("Версия", value: "1.8")
                 }
             }
             .navigationTitle("Настройки")
@@ -2100,6 +2469,57 @@ struct SettingsView: View {
             }
         } else {
             store.disableRoutineSync()
+        }
+    }
+}
+
+// MARK: - Очистка дел на выбранных датах
+
+struct ClearDatesView: View {
+    @EnvironmentObject private var store: Store
+    @State private var selection: Set<DateComponents> = []
+    @State private var confirm = false
+
+    private var dates: [Date] {
+        selection.compactMap { c in
+            guard let y = c.year, let m = c.month, let d = c.day else { return nil }
+            return cal.date(from: DateComponents(year: y, month: m, day: d))
+        }
+    }
+
+    var body: some View {
+        let days = dates
+        let count = store.todoCount(on: days)
+
+        Form {
+            Section {
+                MultiDatePicker("Даты", selection: $selection)
+            } footer: {
+                if days.isEmpty {
+                    Text("Отметьте даты, на которые нужно удалить все дела.")
+                } else {
+                    Text("Выбрано дат: \(days.count) · дел: \(count)")
+                }
+            }
+
+            Section {
+                Button("Очистить выбранные даты", role: .destructive) {
+                    confirm = true
+                }
+                .disabled(days.isEmpty || count == 0)
+            }
+        }
+        .navigationTitle("Очистка дел")
+        .navigationBarTitleDisplayMode(.inline)
+        .confirmationDialog(
+            "Удалить дел: \(count)?",
+            isPresented: $confirm,
+            titleVisibility: .visible
+        ) {
+            Button("Удалить", role: .destructive) {
+                store.clearTodos(on: days)
+                selection = []
+            }
         }
     }
 }
