@@ -1322,18 +1322,7 @@ struct ScheduleTab: View {
                 .contentMargins(.bottom, 170, for: .scrollContent)
                 .overlay {
                     if segs.isEmpty {
-                        ContentUnavailableView {
-                            Label("Распорядок пуст", systemImage: "clock")
-                        } description: {
-                            Text("Нажмите «+», чтобы добавить пункт на этот день")
-                        } actions: {
-                            if store.schedule.isEmpty {
-                                Button("Заполнить типовым распорядком") {
-                                    withAnimation { store.applyTemplate() }
-                                }
-                                .buttonStyle(.bordered)
-                            }
-                        }
+                        emptyState
                     }
                 }
             }
@@ -1364,6 +1353,22 @@ struct ScheduleTab: View {
             }
         }
         .onReceive(ticker) { now = $0 }
+    }
+
+    /// Пустой день; если распорядка нет совсем — предлагаем типовой
+    private var emptyState: some View {
+        ContentUnavailableView {
+            Label("Распорядок пуст", systemImage: "clock")
+        } description: {
+            Text("Нажмите «+», чтобы добавить пункт на этот день")
+        } actions: {
+            if store.schedule.isEmpty {
+                Button("Заполнить типовым распорядком") {
+                    withAnimation { store.applyTemplate() }
+                }
+                .buttonStyle(.bordered)
+            }
+        }
     }
 
     /// Отрезки пунктов этого дня + продолжение вчерашних пунктов, перешедших за полночь
@@ -1661,17 +1666,9 @@ struct ScheduleEditor: View {
                 } header: {
                     Text("Время")
                 } footer: {
-                    let overlap = store.conflicts(
-                        start: time.minutesOfDay, duration: duration,
-                        weekdays: weekdays, excluding: original?.id
-                    )
-                    if !overlap.isEmpty {
-                        Label(
-                            "Пересекается: " + overlap.map { "\($0.title) (\(Fmt.time($0.start)))" }
-                                .joined(separator: ", "),
-                            systemImage: "exclamationmark.triangle.fill"
-                        )
-                        .foregroundStyle(.orange)
+                    if let warning = conflictText {
+                        Label(warning, systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
                     }
                 }
 
@@ -1741,6 +1738,20 @@ struct ScheduleEditor: View {
 
     private var canSave: Bool {
         !title.trimmingCharacters(in: .whitespaces).isEmpty && !weekdays.isEmpty
+    }
+
+    /// Текст предупреждения о пересечении с другими пунктами (nil — пересечений нет)
+    private var conflictText: String? {
+        let overlap: [ScheduleItem] = store.conflicts(
+            start: time.minutesOfDay, duration: duration,
+            weekdays: weekdays, excluding: original?.id
+        )
+        guard !overlap.isEmpty else { return nil }
+        let names: [String] = overlap.map { item in
+            let t: String = Fmt.time(item.start)
+            return item.title + " (" + t + ")"
+        }
+        return "Пересекается: " + names.joined(separator: ", ")
     }
 
     private var previewColor: Color {
@@ -1923,42 +1934,7 @@ struct TodoTab: View {
 
                 List {
                     if !overdue.isEmpty {
-                        Section {
-                            ForEach(overdue) { todo in
-                                HStack(spacing: 8) {
-                                    TodoRow(todo: todo)
-                                    Text(Fmt.string(todo.date, "d MMM"))
-                                        .font(.caption)
-                                        .foregroundStyle(.red)
-                                }
-                                .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                                    Button {
-                                        withAnimation { store.moveToToday([todo]) }
-                                    } label: {
-                                        Label("На сегодня", systemImage: "arrow.uturn.right")
-                                    }
-                                    .tint(.orange)
-                                }
-                                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                                    Button(role: .destructive) {
-                                        withAnimation { store.delete(todo) }
-                                    } label: {
-                                        Label("Удалить", systemImage: "trash")
-                                    }
-                                }
-                            }
-                        } header: {
-                            HStack {
-                                Label("Просрочено", systemImage: "exclamationmark.circle.fill")
-                                    .foregroundStyle(.red)
-                                Spacer()
-                                Button("Всё на сегодня") {
-                                    withAnimation { store.moveToToday(overdue) }
-                                }
-                                .font(.caption.weight(.semibold))
-                            }
-                            .textCase(nil)
-                        }
+                        OverdueSection(items: overdue)
                     }
 
                     if !todos.isEmpty {
@@ -2050,6 +2026,59 @@ struct TodoTab: View {
         .onReceive(NotificationCenter.default.publisher(for: .plannerAdd)) { note in
             if (note.object as? Int) == 2 {
                 sheet = TodoSheetTarget(todo: nil)
+            }
+        }
+    }
+}
+
+/// Невыполненные задачи с прошлых дней (показываются на сегодняшнем дне)
+struct OverdueSection: View {
+    @EnvironmentObject private var store: Store
+    let items: [TodoItem]
+
+    var body: some View {
+        Section {
+            ForEach(items) { todo in
+                row(todo)
+            }
+        } header: {
+            header
+        }
+    }
+
+    private var header: some View {
+        HStack {
+            Label("Просрочено", systemImage: "exclamationmark.circle.fill")
+                .foregroundStyle(Color.red)
+            Spacer()
+            Button("Всё на сегодня") {
+                withAnimation { store.moveToToday(items) }
+            }
+            .font(.caption.weight(.semibold))
+        }
+        .textCase(nil)
+    }
+
+    private func row(_ todo: TodoItem) -> some View {
+        HStack(spacing: 8) {
+            TodoRow(todo: todo)
+            Text(Fmt.string(todo.date, "d MMM"))
+                .font(.caption)
+                .foregroundStyle(Color.red)
+        }
+        .swipeActions(edge: .leading, allowsFullSwipe: true) {
+            Button {
+                withAnimation { store.moveToToday([todo]) }
+            } label: {
+                Label("На сегодня", systemImage: "arrow.uturn.right")
+            }
+            .tint(Color.orange)
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+            Button(role: .destructive) {
+                withAnimation { store.delete(todo) }
+            } label: {
+                Label("Удалить", systemImage: "trash")
             }
         }
     }
@@ -2501,102 +2530,129 @@ struct SettingsView: View {
     @State private var pendingImport: Data?
     @State private var importMessage: String?
 
+    // Тело разбито на части: одним выражением компилятор его не проверяет за разумное время
+
     var body: some View {
         NavigationStack {
-            Form {
-                Section("Внешний вид") {
-                    Picker("Тема", selection: $theme) {
-                        Text("Как в системе").tag(0)
-                        Text("Светлая").tag(1)
-                        Text("Тёмная").tag(2)
+            withDialogs(withSyncHandlers(form))
+        }
+    }
+
+    private var form: some View {
+        Form {
+            appearanceSection
+            remindersSection
+            dataSection
+            backupSection
+            Section {
+                LabeledContent("Версия", value: "1.9")
+            }
+        }
+        .navigationTitle("Настройки")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .confirmationAction) {
+                Button("Готово") { dismiss() }
+            }
+        }
+    }
+
+    private var appearanceSection: some View {
+        Section("Внешний вид") {
+            Picker("Тема", selection: $theme) {
+                Text("Как в системе").tag(0)
+                Text("Светлая").tag(1)
+                Text("Тёмная").tag(2)
+            }
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Цвет акцента")
+                HStack(spacing: 12) {
+                    ForEach(Palette.colors.indices, id: \.self) { i in
+                        accentSwatch(i)
                     }
-
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("Цвет акцента")
-                        HStack(spacing: 12) {
-                            ForEach(Palette.colors.indices, id: \.self) { i in
-                                Button { accent = i } label: {
-                                    Circle()
-                                        .fill(Palette.colors[i].gradient)
-                                        .frame(width: 30, height: 30)
-                                        .overlay {
-                                            if accent == i {
-                                                Image(systemName: "checkmark")
-                                                    .font(.caption.bold())
-                                                    .foregroundStyle(.white)
-                                            }
-                                        }
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                    }
-                    .padding(.vertical, 4)
-                }
-
-                Section {
-                    Toggle("Задачи в Напоминаниях", isOn: $remTasks)
-
-                    if remTasks {
-                        Picker("Список", selection: $remListID) {
-                            if remListID.isEmpty {
-                                Text("Распорядок дня").tag("")
-                            }
-                            ForEach(lists) { l in
-                                Text(l.title).tag(l.id)
-                            }
-                        }
-
-                        Button {
-                            Task { await store.pullReminders() }
-                        } label: {
-                            Label("Синхронизировать сейчас", systemImage: "arrow.triangle.2.circlepath")
-                        }
-                    }
-
-                    Toggle("Напоминать о распорядке", isOn: $remRoutine)
-                } header: {
-                    Text("Напоминания")
-                } footer: {
-                    Text("Задачи синхронизируются в обе стороны через список в приложении «Напоминания». Пункты распорядка создаются там повторяющимися напоминаниями с сигналом в момент начала.")
-                }
-
-                Section("Данные") {
-                    NavigationLink {
-                        ClearDatesView()
-                    } label: {
-                        Label("Очистить дела по датам", systemImage: "calendar.badge.minus")
-                    }
-                    Button("Удалить выполненные задачи") { store.clearCompleted() }
-                    Button("Сбросить всё", role: .destructive) { showReset = true }
-                }
-
-                Section {
-                    ShareLink(item: backupURL()) {
-                        Label("Экспортировать копию", systemImage: "square.and.arrow.up")
-                    }
-                    Button {
-                        showImporter = true
-                    } label: {
-                        Label("Восстановить из копии", systemImage: "square.and.arrow.down")
-                    }
-                } header: {
-                    Text("Резервная копия")
-                } footer: {
-                    Text("Копия — это JSON-файл со всем распорядком и задачами. Сохраните его в «Файлы» или отправьте себе.")
-                }
-
-                Section {
-                    LabeledContent("Версия", value: "1.9")
                 }
             }
-            .navigationTitle("Настройки")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Готово") { dismiss() }
+            .padding(.vertical, 4)
+        }
+    }
+
+    private func accentSwatch(_ i: Int) -> some View {
+        Button { accent = i } label: {
+            Circle()
+                .fill(Palette.colors[i].gradient)
+                .frame(width: 30, height: 30)
+                .overlay {
+                    if accent == i {
+                        Image(systemName: "checkmark")
+                            .font(.caption.bold())
+                            .foregroundStyle(.white)
+                    }
+                }
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var remindersSection: some View {
+        Section {
+            Toggle("Задачи в Напоминаниях", isOn: $remTasks)
+            if remTasks {
+                listPicker
+                Button {
+                    Task { await store.pullReminders() }
+                } label: {
+                    Label("Синхронизировать сейчас", systemImage: "arrow.triangle.2.circlepath")
                 }
             }
+            Toggle("Напоминать о распорядке", isOn: $remRoutine)
+        } header: {
+            Text("Напоминания")
+        } footer: {
+            Text("Задачи синхронизируются в обе стороны через список в приложении «Напоминания». Пункты распорядка создаются там повторяющимися напоминаниями с сигналом в момент начала.")
+        }
+    }
+
+    private var listPicker: some View {
+        Picker("Список", selection: $remListID) {
+            if remListID.isEmpty {
+                Text("Распорядок дня").tag("")
+            }
+            ForEach(lists) { l in
+                Text(l.title).tag(l.id)
+            }
+        }
+    }
+
+    private var dataSection: some View {
+        Section("Данные") {
+            NavigationLink {
+                ClearDatesView()
+            } label: {
+                Label("Очистить дела по датам", systemImage: "calendar.badge.minus")
+            }
+            Button("Удалить выполненные задачи") { store.clearCompleted() }
+            Button("Сбросить всё", role: .destructive) { showReset = true }
+        }
+    }
+
+    private var backupSection: some View {
+        Section {
+            ShareLink(item: backupURL()) {
+                Label("Экспортировать копию", systemImage: "square.and.arrow.up")
+            }
+            Button {
+                showImporter = true
+            } label: {
+                Label("Восстановить из копии", systemImage: "square.and.arrow.down")
+            }
+        } header: {
+            Text("Резервная копия")
+        } footer: {
+            Text("Копия — это JSON-файл со всем распорядком и задачами. Сохраните его в «Файлы» или отправьте себе.")
+        }
+    }
+
+    private func withSyncHandlers<V: View>(_ content: V) -> some View {
+        content
             .onAppear(perform: loadLists)
             .onChange(of: remTasks) { _, on in
                 Task { await tasksChanged(on) }
@@ -2608,15 +2664,15 @@ struct SettingsView: View {
                 Task { await store.taskListChanged() }
             }
             .alert("Нет доступа к Напоминаниям", isPresented: $showDenied) {
-                Button("Открыть настройки") {
-                    if let url = URL(string: UIApplication.openSettingsURLString) {
-                        UIApplication.shared.open(url)
-                    }
-                }
+                Button("Открыть настройки") { openSystemSettings() }
                 Button("Отмена", role: .cancel) {}
             } message: {
                 Text("Разрешите доступ: Настройки → Приложения → Распорядок → Напоминания.")
             }
+    }
+
+    private func withDialogs<V: View>(_ content: V) -> some View {
+        content
             .confirmationDialog(
                 "Удалить все задачи и весь распорядок?",
                 isPresented: $showReset,
@@ -2624,42 +2680,58 @@ struct SettingsView: View {
             ) {
                 Button("Сбросить", role: .destructive) { store.resetAll() }
             }
-            .fileImporter(isPresented: $showImporter, allowedContentTypes: [.json]) { result in
-                guard case .success(let url) = result else { return }
-                let scoped = url.startAccessingSecurityScopedResource()
-                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-                if let data = try? Data(contentsOf: url) {
-                    pendingImport = data
-                } else {
-                    importMessage = "Не удалось прочитать файл."
-                }
+            .fileImporter(isPresented: $showImporter, allowedContentTypes: [UTType.json]) { result in
+                handlePicked(result)
             }
             .confirmationDialog(
                 "Заменить все текущие данные содержимым копии?",
-                isPresented: Binding(
-                    get: { pendingImport != nil },
-                    set: { if !$0 { pendingImport = nil } }
-                ),
+                isPresented: importPending,
                 titleVisibility: .visible
             ) {
-                Button("Восстановить", role: .destructive) {
-                    guard let data = pendingImport else { return }
-                    pendingImport = nil
-                    Task {
-                        let ok = await store.importData(data)
-                        importMessage = ok ? "Данные восстановлены." : "Файл не похож на копию «Распорядка»."
-                    }
-                }
+                Button("Восстановить", role: .destructive) { runImport() }
             }
-            .alert(
-                importMessage ?? "",
-                isPresented: Binding(
-                    get: { importMessage != nil },
-                    set: { if !$0 { importMessage = nil } }
-                )
-            ) {
+            .alert(importMessage ?? "", isPresented: messageShown) {
                 Button("OK", role: .cancel) {}
             }
+    }
+
+    private var importPending: Binding<Bool> {
+        Binding<Bool>(
+            get: { pendingImport != nil },
+            set: { if !$0 { pendingImport = nil } }
+        )
+    }
+
+    private var messageShown: Binding<Bool> {
+        Binding<Bool>(
+            get: { importMessage != nil },
+            set: { if !$0 { importMessage = nil } }
+        )
+    }
+
+    private func openSystemSettings() {
+        if let url = URL(string: UIApplication.openSettingsURLString) {
+            UIApplication.shared.open(url)
+        }
+    }
+
+    private func handlePicked(_ result: Result<URL, any Error>) {
+        guard case .success(let url) = result else { return }
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        if let data = try? Data(contentsOf: url) {
+            pendingImport = data
+        } else {
+            importMessage = "Не удалось прочитать файл."
+        }
+    }
+
+    private func runImport() {
+        guard let data = pendingImport else { return }
+        pendingImport = nil
+        Task {
+            let ok = await store.importData(data)
+            importMessage = ok ? "Данные восстановлены." : "Файл не похож на копию «Распорядка»."
         }
     }
 
