@@ -1,15 +1,17 @@
 //
 //  DayPlannerApp.swift
-//  Распорядок дня + To-Do  (v1.9, MVP)
+//  Распорядок дня + To-Do  (v2.0)
 //
 //  Требования: Xcode 26+, iOS 26.0+ (Liquid Glass).
 //  Для Напоминаний в Info.plist нужен ключ NSRemindersFullAccessUsageDescription
 //  (он уже добавлен в build-ipa.yml).
+//  ИИ-помощник работает через OpenRouter: ключ вводится в приложении (Настройки или окно чата).
 //
 
 import SwiftUI
 import UIKit
 import EventKit
+import Security
 import UniformTypeIdentifiers
 
 // MARK: - Приложение
@@ -1004,6 +1006,8 @@ struct RootView: View {
     @AppStorage("theme") private var theme = 0
     @AppStorage("accent") private var accent = 0
     @State private var tab = 1   // по умолчанию — центральная
+    @State private var showAI = false
+    @StateObject private var aiChat = AIChat()   // переписка живёт, пока открыто приложение
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -1016,8 +1020,9 @@ struct RootView: View {
 
             VStack(spacing: 12) {
                 if tab != 0 {
-                    HStack {
+                    HStack(spacing: 12) {
                         Spacer()
+                        FloatingAIButton { showAI = true }
                         FloatingAddButton(label: tab == 1 ? "Новый пункт" : "Новая задача") {
                             NotificationCenter.default.post(name: .plannerAdd, object: tab)
                         }
@@ -1030,6 +1035,9 @@ struct RootView: View {
             .animation(.snappy, value: tab)
         }
         .sensoryFeedback(.selection, trigger: tab)
+        .sheet(isPresented: $showAI) {
+            AIChatView(chat: aiChat)
+        }
         .task {
             store.extendSeries()
             await store.pullReminders()
@@ -1074,6 +1082,22 @@ struct FloatingAddButton: View {
         .buttonStyle(.glassProminent)
         .buttonBorderShape(.circle)
         .accessibilityLabel(label)
+    }
+}
+
+/// Плавающая кнопка ИИ-помощника (слева от «+»)
+struct FloatingAIButton: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 22, weight: .semibold))
+                .frame(width: 56, height: 56)
+        }
+        .buttonStyle(.glass)
+        .buttonBorderShape(.circle)
+        .accessibilityLabel("ИИ-помощник")
     }
 }
 
@@ -2541,11 +2565,12 @@ struct SettingsView: View {
     private var form: some View {
         Form {
             appearanceSection
+            AISettingsSection()
             remindersSection
             dataSection
             backupSection
             Section {
-                LabeledContent("Версия", value: "1.9")
+                LabeledContent("Версия", value: "2.0")
             }
         }
         .navigationTitle("Настройки")
@@ -2821,5 +2846,682 @@ struct ClearDatesView: View {
                 selection = []
             }
         }
+    }
+}
+
+// MARK: - ИИ-помощник: ключ и настройки
+//
+// Запросы идут в OpenRouter (https://openrouter.ai) — один ключ даёт доступ к разным моделям.
+// Ключ хранится в Связке ключей, модель — в UserDefaults.
+
+enum AIConfig {
+    static let keyName = "openrouterKey"
+    static let defaultModel = "openrouter/auto"
+
+    static var apiKey: String { Keychain.get(keyName) ?? "" }
+}
+
+enum Keychain {
+    private static let service = "DayPlanner"
+
+    private static func query(_ key: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: key
+        ]
+    }
+
+    static func get(_ key: String) -> String? {
+        var q = query(key)
+        q[kSecReturnData as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var out: AnyObject?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
+              let data = out as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// Пустая строка — удалить значение
+    static func set(_ value: String, for key: String) {
+        SecItemDelete(query(key) as CFDictionary)
+        guard !value.isEmpty else { return }
+        var q = query(key)
+        q[kSecValueData as String] = Data(value.utf8)
+        q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        SecItemAdd(q as CFDictionary, nil)
+    }
+}
+
+/// Секция с ключом OpenRouter и моделью (в Настройках и в окне чата)
+struct AISettingsSection: View {
+    @AppStorage("aiModel") private var model = AIConfig.defaultModel
+    @State private var key = AIConfig.apiKey
+    private let onKeyChange: ((String) -> Void)?
+
+    init(onKeyChange: ((String) -> Void)? = nil) {
+        self.onKeyChange = onKeyChange
+    }
+
+    var body: some View {
+        Section {
+            SecureField("Ключ OpenRouter (sk-or-…)", text: $key)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .onChange(of: key) { _, new in
+                    let clean = new.trimmingCharacters(in: .whitespacesAndNewlines)
+                    Keychain.set(clean, for: AIConfig.keyName)
+                    onKeyChange?(clean)
+                }
+            LabeledContent("Модель") {
+                TextField(AIConfig.defaultModel, text: $model)
+                    .multilineTextAlignment(.trailing)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            }
+            if let keys = URL(string: "https://openrouter.ai/keys") {
+                Link(destination: keys) {
+                    Label("Получить ключ", systemImage: "key")
+                }
+            }
+            if let models = URL(string: "https://openrouter.ai/models") {
+                Link(destination: models) {
+                    Label("Список моделей", systemImage: "list.bullet")
+                }
+            }
+        } header: {
+            Text("ИИ-помощник (OpenRouter)")
+        } footer: {
+            Text("Ключ хранится в Связке ключей только на этом устройстве. Модель — идентификатор с сайта OpenRouter, например openrouter/auto или google/gemini-2.5-flash.")
+        }
+    }
+}
+
+// MARK: - ИИ-помощник: запрос к OpenRouter
+
+struct ChatMessage: Codable, Sendable {
+    let role: String      // system / user / assistant
+    let content: String
+}
+
+enum AIError: LocalizedError {
+    case noKey
+    case http(Int, String)
+    case empty
+
+    var errorDescription: String? {
+        switch self {
+        case .noKey:
+            return "Добавьте ключ OpenRouter."
+        case .http(401, _):
+            return "Ключ OpenRouter не подошёл. Проверьте его в настройках."
+        case .http(402, _):
+            return "На счёте OpenRouter закончились средства."
+        case .http(429, _):
+            return "Слишком много запросов. Подождите немного и повторите."
+        case .http(let code, let message):
+            let text = message.isEmpty ? "неизвестная ошибка" : message
+            return "Ошибка OpenRouter (\(code)): \(text)"
+        case .empty:
+            return "Модель вернула пустой ответ. Попробуйте ещё раз или выберите другую модель."
+        }
+    }
+}
+
+enum OpenRouter {
+    private struct Body: Encodable {
+        let model: String
+        let messages: [ChatMessage]
+    }
+
+    private struct Reply: Decodable {
+        struct Choice: Decodable {
+            struct Message: Decodable { let content: String? }
+            let message: Message
+        }
+        struct Failure: Decodable { let message: String? }
+        let choices: [Choice]?
+        let error: Failure?
+    }
+
+    static func complete(model: String, key: String, messages: [ChatMessage]) async throws -> String {
+        guard !key.isEmpty else { throw AIError.noKey }
+        guard let url = URL(string: "https://openrouter.ai/api/v1/chat/completions") else { throw AIError.empty }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 120
+        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("https://github.com/GARCIERcas/DayPlanner2", forHTTPHeaderField: "HTTP-Referer")
+        req.setValue("DayPlanner", forHTTPHeaderField: "X-Title")
+        req.httpBody = try JSONEncoder().encode(Body(model: model, messages: messages))
+
+        let (data, response) = try await URLSession.shared.data(for: req)
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let reply = try? JSONDecoder().decode(Reply.self, from: data)
+
+        // OpenRouter иногда присылает ошибку и с кодом 200
+        if code != 200 || reply?.error != nil {
+            let message = reply?.error?.message ?? String(data: data, encoding: .utf8) ?? ""
+            throw AIError.http(code, message)
+        }
+        guard let text = reply?.choices?.first?.message.content,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw AIError.empty
+        }
+        return text
+    }
+}
+
+// MARK: - ИИ-помощник: промпт и разбор ответа
+
+struct TodoDraft: Hashable {
+    let title: String
+    let date: Date
+}
+
+/// Что предложил ИИ: пункты распорядка и разовые задачи
+struct AIPlan {
+    var reply: String
+    var items: [ScheduleItem]
+    var replace: Bool
+    var todos: [TodoDraft]
+
+    var isEmpty: Bool { items.isEmpty && todos.isEmpty }
+}
+
+enum AIPlanParser {
+    private struct Raw: Decodable {
+        struct Item: Decodable {
+            let title: String
+            let kind: String?
+            let start: String
+            let end: String?
+            let days: [String]?
+        }
+        struct Todo: Decodable {
+            let title: String
+            let date: String
+        }
+        let reply: String?
+        let replace: Bool?
+        let schedule: [Item]?
+        let todos: [Todo]?
+    }
+
+    private static let dayCodes = ["sun": 1, "mon": 2, "tue": 3, "wed": 4, "thu": 5, "fri": 6, "sat": 7]
+
+    static func isoFormatter() -> DateFormatter {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.calendar = Calendar(identifier: .gregorian)
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }
+
+    /// «07:30» → 450
+    private static func minutes(_ s: String) -> Int? {
+        let parts = s.split(separator: ":").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        guard parts.count >= 2, (0...24).contains(parts[0]), (0..<60).contains(parts[1]) else { return nil }
+        return (parts[0] * 60 + parts[1]) % 1440
+    }
+
+    static func parse(_ text: String) -> AIPlan {
+        // модель могла обернуть JSON в ```json … ``` или добавить текст вокруг — берём сам объект
+        guard let s = text.firstIndex(of: "{"), let e = text.lastIndex(of: "}"), s < e,
+              let raw = try? JSONDecoder().decode(Raw.self, from: Data(String(text[s...e]).utf8)) else {
+            return AIPlan(reply: text, items: [], replace: false, todos: [])
+        }
+
+        let items: [ScheduleItem] = (raw.schedule ?? []).compactMap { r in
+            guard let start = minutes(r.start) else { return nil }
+            let duration = r.end.flatMap(minutes).map { ($0 - start + 1440) % 1440 } ?? 0
+            var days = Set((r.days ?? []).compactMap { dayCodes[String($0.lowercased().prefix(3))] })
+            if days.isEmpty { days = Set(1...7) }
+            let kind = RoutineKind(rawValue: (r.kind ?? "").lowercased()) ?? .other
+            let title = r.title.trimmingCharacters(in: .whitespaces)
+            return ScheduleItem(
+                title: title.isEmpty ? kind.title : title,
+                kind: kind, start: start, duration: duration, weekdays: days
+            )
+        }
+
+        let f = isoFormatter()
+        let todos: [TodoDraft] = (raw.todos ?? []).compactMap { t in
+            let title = t.title.trimmingCharacters(in: .whitespaces)
+            guard !title.isEmpty, let d = f.date(from: t.date) else { return nil }
+            return TodoDraft(title: title, date: d.startOfDay)
+        }
+
+        return AIPlan(reply: raw.reply ?? "", items: items, replace: raw.replace ?? false, todos: todos)
+    }
+}
+
+@MainActor
+enum AIPrompt {
+    static func system(store: Store) -> String {
+        let today = Date().startOfDay
+        let iso = AIPlanParser.isoFormatter()
+
+        let routine = weekdayOrder.map { wd -> String in
+            let items = store.items(forWeekday: wd).map { item -> String in
+                let time = Fmt.time(item.start) + (item.duration > 0 ? "–" + Fmt.time(item.end) : "")
+                return "\(time) \(item.title) [\(item.kind.rawValue)]"
+            }
+            return "\(shortWeekday(wd)): " + (items.isEmpty ? "пусто" : items.joined(separator: "; "))
+        }.joined(separator: "\n")
+
+        let upcoming = (0..<7).flatMap { i -> [String] in
+            let day = today.addingDays(i)
+            return store.todos(on: day).filter { !$0.isDone }.map { "\(iso.string(from: day)): \($0.title)" }
+        }
+
+        return """
+        Ты — ИИ-помощник в iOS-приложении «Распорядок дня». Пользователь пишет, как хочет построить свой день или неделю, а ты составляешь для него расписание. Общайся по-русски, дружелюбно и коротко.
+
+        Сегодня: \(iso.string(from: today)) (\(Fmt.string(today, "EEEE"))).
+
+        Текущий распорядок по дням недели:
+        \(routine)
+
+        Невыполненные задачи на ближайшую неделю:
+        \(upcoming.isEmpty ? "нет" : upcoming.joined(separator: "\n"))
+
+        Отвечай ТОЛЬКО одним JSON-объектом, без markdown и текста вокруг:
+        {
+          "reply": "короткий ответ пользователю",
+          "replace": false,
+          "schedule": [
+            {"title": "Завтрак", "kind": "meal", "start": "08:00", "end": "08:30", "days": ["mon", "tue", "wed", "thu", "fri"]}
+          ],
+          "todos": [
+            {"title": "Купить продукты", "date": "YYYY-MM-DD"}
+          ]
+        }
+
+        Правила:
+        - schedule — повторяющийся распорядок. days: mon, tue, wed, thu, fri, sat, sun.
+        - kind — одно из: wake (подъём), meal (еда), sport, work (работа/учёба), free (отдых), sleep (сон), other.
+        - start и end — время "HH:mm". Для мгновенных событий (подъём) end = null. Если пункт идёт за полночь (сон), end меньше start — это нормально.
+        - replace = true, когда пользователь просит составить распорядок заново: тогда все старые пункты на днях из твоего schedule будут удалены, поэтому присылай полный распорядок на эти дни. replace = false — твои пункты просто добавятся к текущим, не повторяй уже существующие.
+        - Пункты распорядка не должны пересекаться по времени.
+        - todos — разовые дела на конкретные даты (дата в формате YYYY-MM-DD). Если дата не названа — ставь сегодняшнюю.
+        - Если не хватает информации или пользователь просто задаёт вопрос — оставь schedule и todos пустыми и спроси/ответь в reply.
+        - В reply кратко опиши, что предлагаешь. Не перечисляй там все пункты — приложение само покажет их карточкой.
+        """
+    }
+}
+
+// MARK: - ИИ-помощник: переписка
+
+struct AIChatMessage: Identifiable {
+    let id = UUID()
+    let role: String      // user / assistant
+    let raw: String       // текст, который уходит в историю для модели
+    var text: String      // что показываем
+    var plan: AIPlan?
+    var applied = false
+}
+
+@MainActor
+final class AIChat: ObservableObject {
+    @Published var messages: [AIChatMessage] = []
+    @Published var loading = false
+    @Published var error: String?
+
+    func send(_ text: String, store: Store, model: String) async {
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, !loading else { return }
+
+        messages.append(AIChatMessage(role: "user", raw: clean, text: clean))
+        loading = true
+        error = nil
+        defer { loading = false }
+
+        let history = [ChatMessage(role: "system", content: AIPrompt.system(store: store))]
+            + messages.suffix(20).map { ChatMessage(role: $0.role, content: $0.raw) }
+        let modelID = model.trimmingCharacters(in: .whitespaces).isEmpty
+            ? AIConfig.defaultModel
+            : model.trimmingCharacters(in: .whitespaces)
+
+        do {
+            let answer = try await OpenRouter.complete(model: modelID, key: AIConfig.apiKey, messages: history)
+            let plan = AIPlanParser.parse(answer)
+            messages.append(AIChatMessage(
+                role: "assistant",
+                raw: answer,
+                text: plan.reply,
+                plan: plan.isEmpty ? nil : plan
+            ))
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    /// Переносит предложение ИИ в распорядок и задачи
+    func apply(_ id: UUID, store: Store) {
+        guard let i = messages.firstIndex(where: { $0.id == id }),
+              let plan = messages[i].plan, !messages[i].applied else { return }
+
+        if plan.replace {
+            let days = Set(plan.items.flatMap(\.weekdays))
+            for wd in days {
+                for old in store.items(forWeekday: wd) {
+                    store.remove(old, fromWeekday: wd)
+                }
+            }
+        }
+        for item in plan.items { store.upsert(item) }
+        for t in plan.todos { store.addTodo(t.title, on: t.date) }
+        messages[i].applied = true
+    }
+
+    func clear() {
+        messages = []
+        error = nil
+    }
+}
+
+// MARK: - ИИ-помощник: окно чата
+
+struct AIChatView: View {
+    @EnvironmentObject private var store: Store
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.brand) private var brand
+    @AppStorage("aiModel") private var model = AIConfig.defaultModel
+    @ObservedObject var chat: AIChat
+
+    @State private var input = ""
+    @State private var hasKey = !AIConfig.apiKey.isEmpty
+    @State private var showSettings = false
+    @FocusState private var focused: Bool
+
+    private let examples = [
+        "Составь распорядок на будни: работаю с 9 до 18, хочу спорт 3 раза в неделю и ложиться в 23:00",
+        "Добавь пробежку по утрам в выходные",
+        "Распланируй дела на завтра: купить продукты, позвонить маме, сдать отчёт"
+    ]
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if hasKey {
+                    conversation
+                } else {
+                    AIKeySetup { hasKey = true }
+                }
+            }
+            .navigationTitle("ИИ-помощник")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Закрыть") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Button {
+                            showSettings = true
+                        } label: {
+                            Label("Ключ и модель", systemImage: "key")
+                        }
+                        Button(role: .destructive) {
+                            withAnimation { chat.clear() }
+                        } label: {
+                            Label("Очистить чат", systemImage: "trash")
+                        }
+                        .disabled(chat.messages.isEmpty)
+                    } label: {
+                        Label("Ещё", systemImage: "ellipsis")
+                    }
+                }
+            }
+        }
+        .sheet(isPresented: $showSettings, onDismiss: { hasKey = !AIConfig.apiKey.isEmpty }) {
+            NavigationStack {
+                Form { AISettingsSection() }
+                    .navigationTitle("ИИ-помощник")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Готово") { showSettings = false }
+                        }
+                    }
+            }
+            .presentationDetents([.medium, .large])
+        }
+    }
+
+    private var conversation: some View {
+        VStack(spacing: 0) {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 12) {
+                        if chat.messages.isEmpty {
+                            welcome
+                        }
+                        ForEach(chat.messages) { m in
+                            bubble(m).id(m.id)
+                        }
+                        if chat.loading {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                Text("Составляю расписание…")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                            }
+                            .id("loading")
+                        }
+                        if let error = chat.error {
+                            Label(error, systemImage: "exclamationmark.triangle.fill")
+                                .font(.subheadline)
+                                .foregroundStyle(.orange)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .id("error")
+                        }
+                    }
+                    .padding()
+                }
+                .scrollDismissesKeyboard(.interactively)
+                .onChange(of: chat.messages.count) { _, _ in
+                    if let last = chat.messages.last?.id {
+                        withAnimation { proxy.scrollTo(last, anchor: .bottom) }
+                    }
+                }
+                .onChange(of: chat.loading) { _, on in
+                    if on { withAnimation { proxy.scrollTo("loading", anchor: .bottom) } }
+                }
+            }
+
+            inputBar
+        }
+    }
+
+    private var welcome: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("Опишите, каким должен быть ваш день — я составлю распорядок и список дел.",
+                  systemImage: "sparkles")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            ForEach(examples, id: \.self) { example in
+                Button {
+                    input = example
+                    focused = true
+                } label: {
+                    Text(example)
+                        .font(.subheadline)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                        .background(brand.opacity(0.12), in: .rect(cornerRadius: 14))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.top, 8)
+    }
+
+    @ViewBuilder
+    private func bubble(_ m: AIChatMessage) -> some View {
+        if m.role == "user" {
+            HStack {
+                Spacer(minLength: 40)
+                Text(m.text)
+                    .padding(12)
+                    .foregroundStyle(.white)
+                    .background(brand, in: .rect(cornerRadius: 18))
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 12) {
+                if !m.text.isEmpty {
+                    Text(m.text)
+                }
+                if let plan = m.plan {
+                    AIPlanCard(plan: plan, applied: m.applied) {
+                        withAnimation { chat.apply(m.id, store: store) }
+                    }
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .glassEffect(.regular, in: .rect(cornerRadius: 18))
+        }
+    }
+
+    private var inputBar: some View {
+        HStack(alignment: .bottom, spacing: 10) {
+            TextField("Напишите, что запланировать…", text: $input, axis: .vertical)
+                .lineLimit(1...5)
+                .focused($focused)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .glassEffect(.regular, in: .rect(cornerRadius: 20))
+
+            Button(action: send) {
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 17, weight: .bold))
+                    .frame(width: 40, height: 40)
+            }
+            .buttonStyle(.glassProminent)
+            .buttonBorderShape(.circle)
+            .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || chat.loading)
+            .accessibilityLabel("Отправить")
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+    }
+
+    private func send() {
+        let text = input
+        input = ""
+        Task { await chat.send(text, store: store, model: model) }
+    }
+}
+
+/// Первый запуск чата: просим ввести ключ OpenRouter
+struct AIKeySetup: View {
+    let onReady: () -> Void
+    @State private var filled = !AIConfig.apiKey.isEmpty
+
+    var body: some View {
+        Form {
+            Section {
+                VStack(alignment: .leading, spacing: 8) {
+                    Image(systemName: "sparkles")
+                        .font(.largeTitle)
+                        .foregroundStyle(.tint)
+                    Text("Подключите ИИ")
+                        .font(.title3.weight(.semibold))
+                    Text("Вставьте ключ OpenRouter — и помощник сможет составлять распорядок и задачи по вашему сообщению.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 6)
+            }
+
+            AISettingsSection { filled = !$0.isEmpty }
+
+            Section {
+                Button("Продолжить", action: onReady)
+                    .frame(maxWidth: .infinity)
+                    .disabled(!filled)
+            }
+        }
+    }
+}
+
+/// Карточка с предложением ИИ и кнопкой «Применить»
+struct AIPlanCard: View {
+    let plan: AIPlan
+    let applied: Bool
+    let onApply: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if !plan.items.isEmpty {
+                Label(plan.replace ? "Новый распорядок" : "В распорядок", systemImage: "clock")
+                    .font(.subheadline.weight(.semibold))
+                ForEach(plan.items) { item in
+                    HStack(spacing: 10) {
+                        Image(systemName: item.displayIcon)
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .frame(width: 28, height: 28)
+                            .background(item.displayColor.gradient, in: .circle)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(item.title)
+                                .font(.callout.weight(.medium))
+                            Text(timeText(item) + " · " + daysText(item.weekdays))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+
+            if !plan.todos.isEmpty {
+                Label("Задачи", systemImage: "checklist")
+                    .font(.subheadline.weight(.semibold))
+                    .padding(.top, plan.items.isEmpty ? 0 : 4)
+                ForEach(plan.todos, id: \.self) { t in
+                    HStack(spacing: 10) {
+                        Image(systemName: "circle")
+                            .foregroundStyle(.secondary)
+                        Text(t.title)
+                            .font(.callout)
+                        Spacer(minLength: 0)
+                        Text(Fmt.string(t.date, "d MMM"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            if plan.replace && !plan.items.isEmpty && !applied {
+                Label("Старые пункты на эти дни будут заменены", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
+            Button(action: onApply) {
+                Label(applied ? "Добавлено" : "Применить",
+                      systemImage: applied ? "checkmark" : "wand.and.stars")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.glassProminent)
+            .disabled(applied)
+        }
+    }
+
+    private func timeText(_ item: ScheduleItem) -> String {
+        item.duration > 0 ? Fmt.time(item.start) + "–" + Fmt.time(item.end) : Fmt.time(item.start)
+    }
+
+    private func daysText(_ days: Set<Int>) -> String {
+        if days.count == 7 { return "каждый день" }
+        if days == [2, 3, 4, 5, 6] { return "будни" }
+        if days == [1, 7] { return "выходные" }
+        return weekdayOrder.filter { days.contains($0) }.map(shortWeekday).joined(separator: ", ")
     }
 }
