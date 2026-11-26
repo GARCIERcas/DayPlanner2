@@ -847,176 +847,29 @@ final class Store: ObservableObject {
     }
 }
 
-// MARK: - Пейджер вкладок (UIKit)
-//
-// Нативный постраничный UIScrollView + UIHostingController на каждую вкладку:
-//  • свайп листает вкладки с обычной физикой iOS (инерция, «резинка» по краям);
-//  • полоса недели (свой горизонтальный скролл) листается сама, вкладки не трогает;
-//  • на последней вкладке свайп влево отдаётся строке задачи (удаление).
-
-final class PagingScrollView: UIScrollView {
-    /// Можно ли начинать листание вкладок для жеста с таким смещением по X
-    var allowPaging: ((CGFloat) -> Bool)?
-
-    override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-        guard gestureRecognizer === panGestureRecognizer else {
-            return super.gestureRecognizerShouldBegin(gestureRecognizer)
-        }
-        let t = panGestureRecognizer.translation(in: self)
-        let v = panGestureRecognizer.velocity(in: self)
-        let dx = t.x != 0 ? t.x : v.x
-        let dy = t.y != 0 ? t.y : v.y
-        guard abs(dx) > abs(dy) else { return false }
-        if hasNestedHorizontalScroll(at: panGestureRecognizer.location(in: self)) { return false }
-        if let allowPaging, !allowPaging(dx) { return false }
-        return super.gestureRecognizerShouldBegin(gestureRecognizer)
-    }
-
-    private func hasNestedHorizontalScroll(at point: CGPoint) -> Bool {
-        var view = hitTest(point, with: nil)
-        while let current = view, current !== self {
-            if let scroll = current as? UIScrollView, scroll.contentSize.width > scroll.bounds.width + 1 {
-                return true
-            }
-            view = current.superview
-        }
-        return false
-    }
-}
-
-final class PagerController: UIViewController, UIScrollViewDelegate {
-    private let scrollView = PagingScrollView()
-    private var hosts: [UIHostingController<AnyView>] = []
-    private var lastToken = ""
-    private var isAnimating = false
-
-    var currentPage = 1
-    var onPageChange: ((Int) -> Void)?
-
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        view.backgroundColor = .clear
-        scrollView.isPagingEnabled = true
-        scrollView.showsHorizontalScrollIndicator = false
-        scrollView.showsVerticalScrollIndicator = false
-        scrollView.contentInsetAdjustmentBehavior = .never
-        scrollView.isDirectionalLockEnabled = true
-        scrollView.delaysContentTouches = false
-        scrollView.delegate = self
-        scrollView.allowPaging = { [weak self] dx in
-            guard let self else { return true }
-            // последняя вкладка: свайп влево — удаление строки, а не листание
-            return !(self.currentPage == self.hosts.count - 1 && dx < 0)
-        }
-        view.addSubview(scrollView)
-    }
-
-    func apply(pages: [AnyView], token: String) {
-        loadViewIfNeeded()
-        if hosts.isEmpty {
-            for page in pages {
-                let host = UIHostingController(rootView: page)
-                host.view.backgroundColor = .clear
-                addChild(host)
-                scrollView.addSubview(host.view)
-                host.didMove(toParent: self)
-                hosts.append(host)
-            }
-            lastToken = token
-            view.setNeedsLayout()
-        } else if token != lastToken {
-            lastToken = token
-            for (host, page) in zip(hosts, pages) { host.rootView = page }
-        }
-    }
-
-    override func viewDidLayoutSubviews() {
-        super.viewDidLayoutSubviews()
-        let w = view.bounds.width
-        let h = view.bounds.height
-        guard w > 0 else { return }
-        scrollView.frame = view.bounds
-        scrollView.contentSize = CGSize(width: w * CGFloat(hosts.count), height: h)
-        for (i, host) in hosts.enumerated() {
-            host.view.frame = CGRect(x: CGFloat(i) * w, y: 0, width: w, height: h)
-        }
-        if !scrollView.isTracking, !scrollView.isDecelerating, !isAnimating {
-            scrollView.contentOffset = CGPoint(x: CGFloat(currentPage) * w, y: 0)
-        }
-    }
-
-    /// Переход на вкладку (нажатие в нижней панели)
-    func goTo(_ page: Int, animated: Bool) {
-        guard page != currentPage, hosts.indices.contains(page) else { return }
-        currentPage = page
-        let w = view.bounds.width
-        guard w > 0 else { return }
-        isAnimating = animated
-        scrollView.setContentOffset(CGPoint(x: CGFloat(page) * w, y: 0), animated: animated)
-    }
-
-    func scrollViewDidScroll(_ sv: UIScrollView) {
-        guard sv.isTracking || sv.isDecelerating else { return }
-        let w = view.bounds.width
-        guard w > 0 else { return }
-        let page = max(0, min(hosts.count - 1, Int((sv.contentOffset.x / w).rounded())))
-        if page != currentPage {
-            currentPage = page
-            onPageChange?(page)
-        }
-    }
-
-    func scrollViewDidEndScrollingAnimation(_ sv: UIScrollView) {
-        isAnimating = false
-    }
-}
-
-struct PagerView: UIViewControllerRepresentable {
-    @Binding var selection: Int
-    let pages: [AnyView]
-    let token: String
-
-    func makeUIViewController(context: Context) -> PagerController {
-        let vc = PagerController()
-        vc.currentPage = selection
-        vc.onPageChange = changeHandler()
-        vc.apply(pages: pages, token: token)
-        return vc
-    }
-
-    func updateUIViewController(_ vc: PagerController, context: Context) {
-        vc.onPageChange = changeHandler()
-        vc.apply(pages: pages, token: token)
-        vc.goTo(selection, animated: true)
-    }
-
-    private func changeHandler() -> (Int) -> Void {
-        let binding = $selection
-        return { page in
-            withAnimation(.snappy) { binding.wrappedValue = page }
-        }
-    }
-}
-
 // MARK: - Корневой экран: 3 вкладки
 
 struct RootView: View {
     @EnvironmentObject private var store: Store
     @Environment(\.scenePhase) private var phase
-    @AppStorage("theme") private var theme = 0
-    @AppStorage("accent") private var accent = 0
     @State private var tab = 1   // по умолчанию — центральная
     @State private var showAI = false
     @StateObject private var aiChat = AIChat()   // переписка живёт, пока открыто приложение
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            PagerView(
-                selection: $tab,
-                pages: [page(CalendarTab()), page(ScheduleTab()), page(TodoTab())],
-                token: "\(theme)-\(accent)"
-            )
-            .ignoresSafeArea()
+            TabView(selection: $tab) {
+                CalendarTab()
+                    .toolbarVisibility(.hidden, for: .tabBar)
+                    .tag(0)
+                ScheduleTab()
+                    .toolbarVisibility(.hidden, for: .tabBar)
+                    .tag(1)
+                TodoTab()
+                    .toolbarVisibility(.hidden, for: .tabBar)
+                    .tag(2)
+            }
+            .tabViewStyle(.tabBarOnly)
 
             VStack(spacing: 12) {
                 if tab != 0 {
@@ -1051,20 +904,6 @@ struct RootView: View {
         .onReceive(NotificationCenter.default.publisher(for: .EKEventStoreChanged)) { _ in
             Task { await store.pullReminders() }
         }
-    }
-
-    /// Каждая вкладка живёт в своём UIHostingController — окружение передаём вручную
-    private func page<V: View>(_ view: V) -> AnyView {
-        let color = Palette.color(accent)
-        return AnyView(
-            view
-                .environmentObject(store)
-                .environment(\.locale, Locale(identifier: "ru_RU"))
-                .environment(\.calendar, Calendar.planner)
-                .environment(\.brand, color)
-                .tint(color)
-                .preferredColorScheme(Palette.scheme(theme))
-        )
     }
 }
 
@@ -1203,12 +1042,6 @@ struct WeekStrip: View {
         .fixedSize(horizontal: false, vertical: true)
         .padding(.vertical, 6)
         .sensoryFeedback(.selection, trigger: weekIndex)
-        .onChange(of: weekIndex) { _, new in
-            // неделю пролистали — выбираем тот же день недели в новой неделе
-            guard let new, new != Self.index(of: date) else { return }
-            let offset = (date.weekday - cal.firstWeekday + 7) % 7
-            date = Self.start(of: new).addingDays(offset)
-        }
         .onChange(of: date) { _, new in
             // дату сменили («Сегодня», выбор дня) — докручиваем полосу до нужной недели
             let i = Self.index(of: new)
@@ -1255,6 +1088,22 @@ struct WeekStrip: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+}
+
+private extension View {
+    func daySwipes(date: Binding<Date>) -> some View {
+        contentShape(Rectangle())
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 24)
+                    .onEnded { drag in
+                        let dx = drag.translation.width
+                        guard abs(dx) >= 44, abs(dx) > 1.5 * abs(drag.translation.height) else { return }
+                        withAnimation(.snappy) {
+                            date.wrappedValue = date.wrappedValue.addingDays(dx < 0 ? 1 : -1)
+                        }
+                    }
+            )
     }
 }
 
@@ -1349,6 +1198,7 @@ struct ScheduleTab: View {
                         emptyState
                     }
                 }
+                .daySwipes(date: $date)
             }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -1980,13 +1830,6 @@ struct TodoTab: View {
 
                     ForEach(todos) { todo in
                         TodoRow(todo: todo)
-                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                                Button(role: .destructive) {
-                                    withAnimation { store.delete(todo) }
-                                } label: {
-                                    Label("Удалить", systemImage: "trash")
-                                }
-                            }
                             .contextMenu {
                                 Button {
                                     sheet = TodoSheetTarget(todo: todo)
@@ -2025,6 +1868,7 @@ struct TodoTab: View {
                         )
                     }
                 }
+                .daySwipes(date: $date)
             }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -2090,15 +1934,12 @@ struct OverdueSection: View {
                 .font(.caption)
                 .foregroundStyle(Color.red)
         }
-        .swipeActions(edge: .leading, allowsFullSwipe: true) {
+        .contextMenu {
             Button {
                 withAnimation { store.moveToToday([todo]) }
             } label: {
                 Label("На сегодня", systemImage: "arrow.uturn.right")
             }
-            .tint(Color.orange)
-        }
-        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
             Button(role: .destructive) {
                 withAnimation { store.delete(todo) }
             } label: {
